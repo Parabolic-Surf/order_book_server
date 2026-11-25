@@ -1,0 +1,6 @@
+target
+.git
+.github
+monitoring
+server/tmp
+*.md

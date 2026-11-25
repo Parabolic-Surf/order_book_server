@@ -1,0 +1,124 @@
+name: Test, build and push image
+
+on:
+  push:
+    branches:
+      - dev
+      - main
+      - "ps/**"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per branch at a time, in order, so an older build that finishes late
+# cannot move a channel tag back.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ECR_REGISTRY: 984941514990.dkr.ecr.ap-northeast-1.amazonaws.com
+  GCR_REGISTRY: gcr.io
+  GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID || 'ps-customer-cloud' }}
+  IMAGE_NAME: hl-book-server
+  DOCKER_BUILD_RECORD_UPLOAD: false
+
+# Actions are pinned to commits: the image job can assume cloud roles.
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: "1.98"
+          components: clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      # Informational: the workspace lints are warnings, so this step does not fail the build.
+      - run: cargo clippy --workspace --all-targets --locked
+      - run: cargo test --workspace --locked
+
+  image:
+    name: Build and push to ECR and GCR
+    # Pull requests build and test only; nothing is published from them.
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      # GCR is pushed once the two GCP secrets exist on this repository.
+      PUSH_GCR: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: arn:aws:iam::984941514990:role/github-ecr-publisher
+          aws-region: ap-northeast-1
+
+      - name: Login to Amazon ECR
+        run: aws ecr get-login-password --region ap-northeast-1 | docker login --username AWS --password-stdin "${ECR_REGISTRY}"
+
+      - name: Authenticate to Google Cloud
+        if: env.PUSH_GCR == 'true'
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        if: env.PUSH_GCR == 'true'
+        uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2
+
+      - name: Configure Docker for GCR
+        if: env.PUSH_GCR == 'true'
+        run: gcloud auth configure-docker "${GCR_REGISTRY}" --quiet
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # <channel>-<sha> is the deployment tag deploykit resolves; the bare channel
+      # tag follows the newest build of the branch. A branch name may contain
+      # characters a tag may not, so they become "-".
+      - name: Tag names
+        id: tags
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          channel=$(printf '%s' "${REF_NAME}" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-80)
+          images="${ECR_REGISTRY}/${IMAGE_NAME}"
+          if [ "${PUSH_GCR}" = "true" ]; then
+            images="${images} ${GCR_REGISTRY}/${GCP_PROJECT_ID}/${IMAGE_NAME}"
+          else
+            echo "::warning::GCP secrets are not set on this repository; pushing to ECR only."
+          fi
+          {
+            echo "tags<<EOF"
+            for image in ${images}; do
+              echo "${image}:${channel}-${SHA}"
+              echo "${image}:${channel}"
+            done
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=${{ env.IMAGE_NAME }}
+          cache-to: type=gha,scope=${{ env.IMAGE_NAME }},mode=max,ignore-error=true
+          provenance: false
