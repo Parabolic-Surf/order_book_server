@@ -878,7 +878,7 @@ pub(crate) type L2BuiltFrame = (u64, bytes::Bytes, L2Book);
 pub(crate) struct L2FrameCache(std::sync::Mutex<rustc_hash::FxHashMap<L2FrameKey, Arc<L2BuiltFrame>>>);
 
 impl L2FrameCache {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(std::sync::Mutex::new(rustc_hash::FxHashMap::default()))
     }
 

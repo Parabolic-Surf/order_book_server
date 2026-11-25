@@ -508,7 +508,7 @@ async fn run_session(
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
                                     if snapshot_serves(*shard, sub) {
-                                        alive &= send_ws_data_from_snapshot(outbound, sub, l2_snapshots.as_ref(), *time, last_l2, dirty, force_full, l2_frames, l2_hb.is_some()).await;
+                                        alive &= send_ws_data_from_snapshot(outbound, sub, l2_snapshots.as_ref(), *time, last_l2, dirty, force_full, l2_frames, l2_hb.is_some(), universe).await;
                                     }
                                 }
                                 if let Some(pending) = force_full_l2.get_mut(shard.index()) {
@@ -1034,6 +1034,7 @@ async fn send_ws_data_from_snapshot(
     force_full: bool,
     l2_frames: &L2FrameCache,
     store_payload: bool,
+    universe: &HashSet<String>,
 ) -> bool {
     // BBO subscriptions are filtered out by the caller (they are served by the
     // BboUpdate fast path), so only L2Book needs handling here.
@@ -1062,6 +1063,11 @@ async fn send_ws_data_from_snapshot(
                 };
                 Some(variant)
             }
+            // A listed coin that is missing here has a book that is not rebuilt
+            // yet: after an install or a change of shapes the L2 cache refills
+            // over several flushes. Wait for it. Sending an empty book would
+            // tell a new subscriber that a live market has no orders.
+            None if universe.contains(coin.as_str()) => return true,
             // The coin's book emptied and the multi-book evicted it. Send an
             // empty snapshot so subscribers learn the book is gone instead of
             // keeping the last non-empty payload on screen forever.
@@ -1774,6 +1780,29 @@ mod tests {
         assert_eq!(q.max_px.as_deref(), Some("66000"));
         let bare: L4SnapshotQuery = serde_json::from_str(r#"{"coin":"BTC"}"#).unwrap();
         assert!(bare.min_px.is_none() && bare.max_px.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_a_listed_coin_missing_from_a_snapshot_is_not_sent_as_an_empty_book() {
+        let (data_tx, mut data_rx) = mpsc::channel(8);
+        let (pong_tx, _pong_rx) = mpsc::channel(8);
+        let outbound = Outbound { data_tx, pong_tx };
+        let sub = Subscription::L2Book { coin: "BTC".to_string(), n_sig_figs: None, n_levels: None, mantissa: None };
+        let (books, dirty, frames) = (HashMap::new(), HashSet::new(), L2FrameCache::new());
+        let mut last_l2 = HashMap::new();
+
+        // BTC is listed but not rebuilt yet: a new subscriber waits for the next flush.
+        let listed: HashSet<String> = ["BTC".to_string()].into();
+        assert!(send_ws_data_from_snapshot(&outbound, &sub, &books, 1, &mut last_l2, &dirty, false, &frames, false, &listed).await);
+        assert!(data_rx.try_recv().is_err(), "an empty book would say a live market has no orders");
+        assert!(last_l2.is_empty(), "nothing was sent, so the next flush must still treat it as new");
+
+        // BTC is no longer listed: its book is gone, and the subscriber is told.
+        let delisted = HashSet::new();
+        assert!(send_ws_data_from_snapshot(&outbound, &sub, &books, 2, &mut last_l2, &dirty, false, &frames, false, &delisted).await);
+        let frame: serde_json::Value = serde_json::from_slice(&data_rx.try_recv().unwrap()).unwrap();
+        assert_eq!(frame["channel"], "l2Book");
+        assert_eq!(frame["data"]["levels"], serde_json::json!([[], []]));
     }
 
     #[test]
