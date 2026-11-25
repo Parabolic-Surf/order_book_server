@@ -166,14 +166,19 @@ By default every book update is applied by one thread, which limits a server to 
 orderbook_server --markets perps,hip3 --hip3-dexes xyz --book-threads 3 ...
 ```
 
-Clients see no difference: one address, the same channels, the same messages.
+Clients use the server as before: one address and the same channels. Everything about one coin is unchanged. Two things that span coins differ with more than one thread:
+
+- `orderUpdates` is per user, and a user's orders can be in coins of different groups. Each group sends its own message, so a block's updates can arrive as several messages, and a message from one group can overtake an earlier block from another. Order by the height in the message if that matters.
+- `GET /untriggeredOrders` without a coin reports the lowest height among the groups, which is the height all of them have reached.
 
 How it works:
 
 - A coin belongs to one group, chosen by a hash of its name. The assignment is fixed, so it is the same after a restart.
 - One reader parses the node's files and hands each event to the group that owns its coin. Events of one coin stay in order.
 - A request for one coin's book locks only that coin's group; the other groups keep applying.
-- At startup and at a re-sync, groups that need a node snapshot at the same time share a single dump.
+- At startup and at a re-sync, groups that need a node snapshot at the same time share a single dump, and dumps are at least 10 seconds apart.
+
+Metrics with more than one thread: counts of orders, coins and pending entries are sums over the groups. `orderbook_desyncs_total` counts each group, so one loss in the reader shows up once per group.
 
 Sizing:
 

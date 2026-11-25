@@ -44,6 +44,16 @@ pub(crate) const MAX_BOOK_THREADS: usize = 16;
 /// How long the unclaimed part of a node snapshot is kept for groups that have not taken theirs.
 const DUMP_KEEP: Duration = Duration::from_secs(120);
 
+/// Wait this long before starting a dump. Groups ask within milliseconds of
+/// each other; the ones that began caching inside this window share the dump
+/// instead of each waiting for one of its own.
+const DUMP_SETTLE: Duration = Duration::from_millis(250);
+
+/// Least time between the end of one dump and the start of the next. Each
+/// group paces its own re-syncs; this keeps several groups from running the
+/// node's dump back to back.
+const DUMP_MIN_GAP: Duration = Duration::from_secs(10);
+
 /// What the groups of one server share: each group's coins, and through them readiness.
 pub(crate) struct ShardGroup {
     universes: StdMutex<Vec<Option<Arc<HashSet<String>>>>>,
@@ -181,12 +191,14 @@ impl BookShards {
         if let Some(coin) = coin {
             return self.for_coin(coin.as_str()).lock().await.compute_untriggered_snapshot(Some(coin));
         }
-        let (mut time, mut height, mut orders) = (0, 0, Vec::new());
+        let (mut time, mut height, mut orders) = (u64::MAX, u64::MAX, Vec::new());
         for listener in self.listeners.iter() {
             let (group_time, group_height, group_orders) = listener.lock().await.compute_untriggered_snapshot(None)?;
-            // Groups are read one after another, so the newest stamp covers them all.
-            time = time.max(group_time);
-            height = height.max(group_height);
+            // Groups are read one after another. The oldest stamp is the one
+            // every group has reached: a reader that resumes from it may see
+            // a change twice but cannot miss one.
+            time = time.min(group_time);
+            height = height.min(group_height);
             orders.extend(group_orders);
         }
         Some((time, height, orders))
@@ -244,16 +256,30 @@ struct SharedDump {
     started: Instant,
     height: u64,
     had_untriggered: bool,
-    rest: StdMutex<(Snapshots<InnerL4Order>, Vec<InnerL4Order>)>,
+    rest: StdMutex<DumpRest>,
+}
+
+/// What no group has taken yet.
+struct DumpRest {
+    snapshot: Snapshots<InnerL4Order>,
+    untriggered: Vec<InnerL4Order>,
+    /// Groups that have not taken their share.
+    claims_left: usize,
 }
 
 impl SharedDump {
     fn take(&self, markets: &MarketFilter) -> SnapshotPart {
         let mut rest = self.rest.lock().unwrap_or_else(PoisonError::into_inner);
-        let snapshot = rest.0.take_coins(|coin| markets.includes_coin(coin));
+        let snapshot = rest.snapshot.take_coins(|coin| markets.includes_coin(coin));
         let (untriggered, others) =
-            std::mem::take(&mut rest.1).into_iter().partition(|order| markets.includes_coin(&order.coin));
-        rest.1 = others;
+            std::mem::take(&mut rest.untriggered).into_iter().partition(|order| markets.includes_coin(&order.coin));
+        rest.untriggered = others;
+        rest.claims_left = rest.claims_left.saturating_sub(1);
+        if rest.claims_left == 0 {
+            // Every group has its share; what is left belongs to markets nobody tracks.
+            rest.snapshot = Snapshots::new(std::collections::HashMap::new());
+            rest.untriggered = Vec::new();
+        }
         SnapshotPart { height: self.height, snapshot, untriggered, dump_had_untriggered: self.had_untriggered }
     }
 }
@@ -275,17 +301,32 @@ enum DumpSource {
 pub(crate) struct SnapshotBroker {
     source: DumpSource,
     track_untriggered: bool,
-    latest: Mutex<Option<Arc<SharedDump>>>,
+    /// How many groups take a share of each dump.
+    groups: usize,
+    latest: Mutex<Latest>,
+}
+
+/// Guarded by one lock, which also makes dumps run one at a time.
+#[derive(Default)]
+struct Latest {
+    dump: Option<Arc<SharedDump>>,
+    /// When the last dump ended, whether it worked or not.
+    finished: Option<Instant>,
 }
 
 impl SnapshotBroker {
-    pub(super) fn new(config: SnapshotConfig, track_untriggered: bool) -> Arc<Self> {
-        Arc::new(Self { source: DumpSource::Node(config), track_untriggered, latest: Mutex::new(None) })
+    pub(super) fn new(config: SnapshotConfig, track_untriggered: bool, groups: usize) -> Arc<Self> {
+        Arc::new(Self { source: DumpSource::Node(config), track_untriggered, groups, latest: Mutex::default() })
     }
 
     #[cfg(test)]
-    pub(super) fn fixed(load: impl Fn() -> Result<LoadedDump> + Send + Sync + 'static) -> Arc<Self> {
-        Arc::new(Self { source: DumpSource::Fixed(Box::new(load)), track_untriggered: true, latest: Mutex::new(None) })
+    pub(super) fn fixed(groups: usize, load: impl Fn() -> Result<LoadedDump> + Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            source: DumpSource::Fixed(Box::new(load)),
+            track_untriggered: true,
+            groups,
+            latest: Mutex::default(),
+        })
     }
 
     /// The caller's share of a snapshot that is safe for it to install: one
@@ -294,13 +335,18 @@ impl SnapshotBroker {
     pub(super) async fn fetch(self: &Arc<Self>, caching_since: Instant, markets: &MarketFilter) -> Result<SnapshotPart> {
         let dump = {
             let mut latest = self.latest.lock().await;
-            match latest.as_ref() {
+            match latest.dump.as_ref() {
                 Some(dump) if dump.started >= caching_since => Arc::clone(dump),
                 _ => {
                     // Free what is left of the previous dump before loading the next.
-                    *latest = None;
-                    let dump = Arc::new(self.dump().await?);
-                    *latest = Some(Arc::clone(&dump));
+                    latest.dump = None;
+                    if let Some(finished) = latest.finished {
+                        tokio::time::sleep_until(finished + DUMP_MIN_GAP).await;
+                    }
+                    let result = self.dump().await;
+                    latest.finished = Some(Instant::now());
+                    let dump = Arc::new(result?);
+                    latest.dump = Some(Arc::clone(&dump));
                     self.forget_later(&dump);
                     dump
                 }
@@ -310,6 +356,7 @@ impl SnapshotBroker {
     }
 
     async fn dump(&self) -> Result<SharedDump> {
+        tokio::time::sleep(DUMP_SETTLE).await;
         // Stamped before the height is read: a group that began caching before
         // this moment has every event the dump could be missing.
         let started = Instant::now();
@@ -329,7 +376,8 @@ impl SnapshotBroker {
         };
         info!("Snapshot loaded at height {height} ({} untriggered orders)", untriggered.len());
         let had_untriggered = !untriggered.is_empty() || (self.track_untriggered && snapshot.has_triggers());
-        Ok(SharedDump { started, height, had_untriggered, rest: StdMutex::new((snapshot, untriggered)) })
+        let rest = DumpRest { snapshot, untriggered, claims_left: self.groups };
+        Ok(SharedDump { started, height, had_untriggered, rest: StdMutex::new(rest) })
     }
 
     /// Drop the unclaimed part of `dump` after a while: a group that did not
@@ -343,8 +391,8 @@ impl SnapshotBroker {
                 return;
             };
             let mut latest = broker.latest.lock().await;
-            if latest.as_ref().is_some_and(|current| Arc::ptr_eq(current, &dump)) {
-                *latest = None;
+            if latest.dump.as_ref().is_some_and(|current| Arc::ptr_eq(current, &dump)) {
+                latest.dump = None;
             }
         });
     }
@@ -515,12 +563,12 @@ mod tests {
         (books, untriggered)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn groups_share_one_dump_and_each_takes_only_its_coins() {
         let dumps = Arc::new(AtomicUsize::new(0));
         let broker = {
             let dumps = Arc::clone(&dumps);
-            SnapshotBroker::fixed(move || {
+            SnapshotBroker::fixed(3, move || {
                 dumps.fetch_add(1, Ordering::SeqCst);
                 Ok(dump_of(&COINS))
             })
@@ -547,32 +595,74 @@ mod tests {
         assert_eq!(all_books, expected);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_group_that_began_caching_after_the_dump_gets_a_new_one() {
         let dumps = Arc::new(AtomicUsize::new(0));
         let broker = {
             let dumps = Arc::clone(&dumps);
-            SnapshotBroker::fixed(move || {
+            SnapshotBroker::fixed(1, move || {
                 dumps.fetch_add(1, Ordering::SeqCst);
                 Ok(dump_of(&COINS))
             })
         };
         let markets = MarketFilter::all();
         broker.fetch(Instant::now(), &markets).await.unwrap();
+        let first_done = Instant::now();
         tokio::time::sleep(Duration::from_millis(5)).await;
 
         // Its cache starts after the first dump, so that dump may hold events it never cached.
         let part = broker.fetch(Instant::now(), &markets).await.unwrap();
         assert_eq!(dumps.load(Ordering::SeqCst), 2);
         assert_eq!(part_coins(&part).0.len(), COINS.len(), "a new dump is whole again");
+        assert!(Instant::now() - first_done >= DUMP_MIN_GAP, "dumps are spaced out, whoever asks");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn groups_that_begin_caching_moments_apart_share_the_dump() {
+        // Group threads ask within milliseconds of each other; neither should
+        // have to wait for a dump of its own.
+        let dumps = Arc::new(AtomicUsize::new(0));
+        let broker = {
+            let dumps = Arc::clone(&dumps);
+            SnapshotBroker::fixed(2, move || {
+                dumps.fetch_add(1, Ordering::SeqCst);
+                Ok(dump_of(&COINS))
+            })
+        };
+        let first = {
+            let broker = Arc::clone(&broker);
+            let markets = MarketFilter::all().for_shard(ShardRoute::new(0, 2));
+            let caching_since = Instant::now();
+            tokio::spawn(async move { broker.fetch(caching_since, &markets).await.map(|part| part.height) })
+        };
+        tokio::time::sleep(DUMP_SETTLE / 2).await;
+        let second = MarketFilter::all().for_shard(ShardRoute::new(1, 2));
+        broker.fetch(Instant::now(), &second).await.unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), 42);
+        assert_eq!(dumps.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nothing_is_kept_once_every_group_has_its_share() {
+        // Coins of markets nobody tracks would otherwise sit in memory until the timer.
+        let broker = SnapshotBroker::fixed(2, || Ok(dump_of(&COINS)));
+        let markets = MarketFilter::new(true, false, false, Vec::new());
+        let caching_since = Instant::now();
+        for index in 0..2 {
+            broker.fetch(caching_since, &markets.for_shard(ShardRoute::new(index, 2))).await.unwrap();
+            let latest = broker.latest.lock().await;
+            let rest = latest.dump.as_ref().unwrap().rest.lock().unwrap();
+            let left = rest.snapshot.as_ref_for_test().len() + rest.untriggered.len();
+            assert_eq!(left == 0, index == 1, "after group {index}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn a_failed_dump_is_reported_and_not_kept() {
         let attempts = Arc::new(AtomicUsize::new(0));
         let broker = {
             let attempts = Arc::clone(&attempts);
-            SnapshotBroker::fixed(move || {
+            SnapshotBroker::fixed(1, move || {
                 if attempts.fetch_add(1, Ordering::SeqCst) == 0 { Err("node busy".into()) } else { Ok(dump_of(&COINS)) }
             })
         };
@@ -591,7 +681,7 @@ mod tests {
         let books = BookShards::new(count, Some(tx), MarketFilter::all(), ActiveL2Params::new(), |_| {});
         let broker = {
             let dumps = Arc::clone(dumps);
-            SnapshotBroker::fixed(move || {
+            SnapshotBroker::fixed(count, move || {
                 dumps.fetch_add(1, Ordering::SeqCst);
                 Ok(dump_of(&COINS))
             })
@@ -676,17 +766,45 @@ mod tests {
             assert_eq!(bids, expected, "the dump's order plus the new one, in BTC's group only");
         }
         assert_eq!(dumps.load(Ordering::SeqCst), 1, "applying events needs no further dump");
+
+        // One group moves ahead of the others. A list over all groups is stamped
+        // with the height every group has reached, so resuming from it misses nothing.
+        books.listeners()[owner].lock().await.apply_event_batch(
+            60,
+            EventBatch::Orders(status_batch(&[], 60)),
+            EventSource::OrderStatuses,
+        );
+        let (_, height, _) = books.untriggered_snapshot(None).await.unwrap();
+        assert_eq!(height, 50);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_listener_keeps_the_start_of_its_cache_until_a_new_one_begins() {
+        // At startup the cache runs from construction, so asking for the first
+        // snapshot later must not move the stamp: that is what lets all groups share it.
+        let books = BookShards::new(1, None, MarketFilter::all(), ActiveL2Params::new(), |_| {});
+        let listener = &books.listeners()[0];
+        let built = listener.lock().await.caching_since;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        listener.lock().await.begin_caching();
+        assert_eq!(listener.lock().await.caching_since, built);
+
+        // After an install the cache is gone; the next one starts a new stamp.
+        listener.lock().await.init_from_snapshot(Snapshots::new(HashMap::new()), 10);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        listener.lock().await.begin_caching();
+        assert!(listener.lock().await.caching_since > built);
     }
 
     #[tokio::test(start_paused = true)]
     async fn the_unclaimed_part_of_a_dump_is_dropped_after_a_while() {
-        let broker = SnapshotBroker::fixed(|| Ok(dump_of(&COINS)));
+        let broker = SnapshotBroker::fixed(2, || Ok(dump_of(&COINS)));
         let caching_since = Instant::now();
         let first = MarketFilter::all().for_shard(ShardRoute::new(0, 2));
         broker.fetch(caching_since, &first).await.unwrap();
-        assert!(broker.latest.lock().await.is_some());
+        assert!(broker.latest.lock().await.dump.is_some());
 
         tokio::time::sleep(DUMP_KEEP + Duration::from_secs(1)).await;
-        assert!(broker.latest.lock().await.is_none());
+        assert!(broker.latest.lock().await.dump.is_none());
     }
 }

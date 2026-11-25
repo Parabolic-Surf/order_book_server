@@ -74,13 +74,14 @@ fn fetch_snapshot(broker: Arc<SnapshotBroker>, listener: Arc<Mutex<OrderBookList
         // book-affecting batch that arrives while hl-node dumps state is cached,
         // and the install replays the ones above the snapshot height - so the
         // handoff from snapshot to live stream is gapless.
-        let markets = {
+        // The broker only hands out a dump that began after the cache did. At
+        // startup the cache runs from construction, so all groups share the
+        // first dump.
+        let (markets, caching_since) = {
             let mut listener = listener.lock().await;
             listener.begin_caching();
-            listener.markets.clone()
+            (listener.markets.clone(), listener.caching_since)
         };
-        // The broker only hands out a dump that began after this moment.
-        let caching_since = Instant::now();
 
         let res = match broker.fetch(caching_since, &markets).await {
             // Phased install: build the replacement book and chase the replay
@@ -380,6 +381,9 @@ pub(crate) struct OrderBookListener {
     // this is what lets a brand-new subscriber be served within one throttle window
     // even on an otherwise-quiet coin.
     last_active_l2_params: HashSet<L2SnapshotParams>,
+    // When the current replay cache was started. A node snapshot is safe to
+    // install only if its dump began after this moment.
+    caching_since: Instant,
     // What this listener shares with the other groups of the server.
     group: Arc<ShardGroup>,
     // Applied batches, for the periodic progress work.
@@ -449,6 +453,7 @@ impl OrderBookListener {
             active_l2_params,
             active_subs,
             last_active_l2_params: HashSet::new(),
+            caching_since: Instant::now(),
             group,
             progress_count: 0,
             reported: ReportedCounts::default(),
@@ -509,6 +514,7 @@ impl OrderBookListener {
         if self.fetched_snapshot_cache.is_none() {
             self.fetched_snapshot_cache = Some(VecDeque::new());
             self.cached_event_count = 0;
+            self.caching_since = Instant::now();
         }
     }
 
@@ -1154,7 +1160,10 @@ impl OrderBookListener {
                             drop(tx.send(msg));
                         }
                     }
-                    EVENTS_PROCESSED_TOTAL.with_label_values(&["orders"]).inc();
+                    // An empty batch only carries the block to this group.
+                    if batch.events_len() > 0 {
+                        EVENTS_PROCESSED_TOTAL.with_label_values(&["orders"]).inc();
+                    }
                     state.apply_order_statuses_hft(batch)
                 }
                 EventBatch::BookDiffs(batch) => {
@@ -1177,7 +1186,9 @@ impl OrderBookListener {
                             }
                         }
                     }
-                    EVENTS_PROCESSED_TOTAL.with_label_values(&["diffs"]).inc();
+                    if batch.events_len() > 0 {
+                        EVENTS_PROCESSED_TOTAL.with_label_values(&["diffs"]).inc();
+                    }
                     state.apply_order_diffs_hft(batch)
                 }
                 EventBatch::Fills(batch) => {
@@ -1228,7 +1239,9 @@ impl OrderBookListener {
         } else {
             HashSet::new()
         };
-        EVENT_PROCESSING_LATENCY.with_label_values(&[source_label]).observe(process_start.elapsed().as_secs_f64());
+        if events_len > 0 {
+            EVENT_PROCESSING_LATENCY.with_label_values(&[source_label]).observe(process_start.elapsed().as_secs_f64());
+        }
         // Staleness signal for /health: one atomic store per applied batch.
         // Only the live-apply path advances it - batches consumed by the
         // replay cache bailed out above, so a not-yet-ready book stays stale.
@@ -1242,9 +1255,11 @@ impl OrderBookListener {
         self.progress_count += 1;
         if sc % 1000 == 0 {
             if let Some(state) = &mut self.order_book_state {
-                // Record health metrics
-                ORDERBOOK_HEIGHT.set(state.height() as i64);
-                ORDERBOOK_TIME_MS.set(state.time() as i64);
+                // Record health metrics. Groups report in turn, so only move forward.
+                if state.height() as i64 >= ORDERBOOK_HEIGHT.get() {
+                    ORDERBOOK_HEIGHT.set(state.height() as i64);
+                    ORDERBOOK_TIME_MS.set(state.time() as i64);
+                }
                 // Counts are sums over the groups: each adds its own change.
                 let reported = &mut self.reported;
                 report_count(&PENDING_ORDERS_CACHE, &mut reported.pending_statuses, state.pending_order_statuses_count());
@@ -1667,7 +1682,7 @@ pub(crate) async fn hl_listen_hft(shards: BookShards, config: crate::ServerConfi
         data_dir: dir.clone(),
     };
 
-    let broker = SnapshotBroker::new(snapshot_config.clone(), !config.bbo_only);
+    let broker = SnapshotBroker::new(snapshot_config.clone(), !config.bbo_only, shards.count());
 
     // Startup-backfill floor: the node's currently persisted height. The initial
     // snapshot is generated after this point, so its height is >= the floor and
@@ -1689,7 +1704,7 @@ pub(crate) async fn hl_listen_hft(shards: BookShards, config: crate::ServerConfi
     // One apply thread per group, each fed through its own queue. A queue is
     // bounded, so a group that falls behind slows the reader down (and through
     // it the file watchers) instead of piling parsed events up in memory.
-    const SHARD_QUEUE_CHUNKS: usize = 1024;
+    const SHARD_QUEUE_CHUNKS: usize = 128;
     let count = shards.count();
     let markets = shards.markets().clone();
     let runtime = tokio::runtime::Handle::current();

@@ -105,7 +105,8 @@ impl FileReader {
             file: None,
             file_position: 0,
             partial_line: Vec::new(),
-            base_dir,
+            // The watcher reports absolute paths even when the folder was given relative.
+            base_dir: std::path::absolute(&base_dir).unwrap_or(base_dir),
             desynced: false,
         }
     }
@@ -1081,6 +1082,22 @@ mod tests {
         assert!(!reader.is_stream_file(&day), "a day folder is not a stream file");
         assert!(!reader.is_stream_file(&day.join("21")), "a file that does not exist is not a stream file");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_a_relative_data_folder_still_matches_absolute_event_paths() {
+        // Events arrive with absolute paths whatever form the folder was given in.
+        let relative = PathBuf::from(format!("tmp/obs_watcher_relative_{}", std::process::id()));
+        let day = relative.join("hourly").join("20261125");
+        std::fs::create_dir_all(&day).unwrap();
+        append(&day.join("20"), "x\n");
+        let reader = FileReader::new(relative.clone());
+
+        let event_path = std::env::current_dir().unwrap().join(&day).join("20");
+        assert!(event_path.is_absolute());
+        assert!(reader.is_stream_file(&event_path));
+        assert_eq!(reader.find_latest_file(), Some(event_path));
+        std::fs::remove_dir_all(&relative).ok();
     }
 
     #[test]
