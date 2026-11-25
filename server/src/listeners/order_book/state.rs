@@ -208,6 +208,12 @@ impl OrderBookState {
         self.untriggered_orders.values().map(rustc_hash::FxHashMap::len).sum()
     }
 
+    /// The dump this state was built from carried trigger orders in coins that
+    /// were not handed to this state, so it is still the authority on them.
+    pub(super) const fn note_dump_had_untriggered(&mut self) {
+        self.dump_had_untriggered = true;
+    }
+
     /// Carry the previous state's untriggered table into this freshly-built one
     /// when the snapshot contributed nothing. The hl-node L4 dump on current
     /// node versions contains no trigger orders, so a rebuild from it alone

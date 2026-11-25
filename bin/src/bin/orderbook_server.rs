@@ -131,6 +131,13 @@ struct Args {
     /// drops the cache, installs a gapped book, and forces another re-sync.
     #[arg(long, default_value = "4000000")]
     replay_cache_events: usize,
+
+    /// Threads that apply events. The coins are split into this many groups,
+    /// each applied on its own thread, so the server can use that many cores
+    /// for the books. Clients see one server either way. The replay cache cap
+    /// applies to each thread.
+    #[arg(long, default_value = "1", value_parser = clap::value_parser!(u8).range(1..=server::MAX_BOOK_THREADS as i64))]
+    book_threads: u8,
 }
 
 /// Build the market filter from `--markets` and `--hip3-dexes`.
@@ -211,11 +218,13 @@ async fn main() -> Result<()> {
         bbo_heartbeat_ms: args.bbo_heartbeat_ms,
         no_resync: args.no_resync,
         replay_cache_events: args.replay_cache_events,
+        book_threads: usize::from(args.book_threads),
     };
 
     println!("Orderbook Server v{}", env!("CARGO_PKG_VERSION"));
     println!("  Address: {}", config.address);
     println!("  Markets: {}", config.markets);
+    println!("  Book threads: {}", config.book_threads);
     if config.bbo_only {
         println!("  Mode: BBO-ONLY (lightweight, ~100MB RAM)");
         println!("  Note: L2/L4/Trades subscriptions disabled");
@@ -333,5 +342,20 @@ mod tests {
     #[test]
     fn unknown_markets_are_rejected() {
         assert!(parse(&["--markets", "futures"]).is_err());
+    }
+
+    fn book_threads(options: &[&str]) -> std::result::Result<u8, String> {
+        let mut command_line = vec!["orderbook_server"];
+        command_line.extend_from_slice(options);
+        Args::try_parse_from(command_line).map(|parsed| parsed.book_threads).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn book_threads_default_to_one_and_stay_in_range() {
+        assert_eq!(book_threads(&[]).unwrap(), 1);
+        assert_eq!(book_threads(&["--book-threads", "4"]).unwrap(), 4);
+        assert_eq!(usize::from(book_threads(&["--book-threads", "16"]).unwrap()), server::MAX_BOOK_THREADS);
+        assert!(book_threads(&["--book-threads", "0"]).is_err());
+        assert!(book_threads(&["--book-threads", "17"]).is_err());
     }
 }

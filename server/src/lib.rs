@@ -66,6 +66,14 @@ pub struct ServerConfig {
     /// Cap on events cached for gapless replay while a snapshot fetch is in
     /// flight (~0.5-1KB resident each). Must cover a full fetch window at
     /// peak event rate or every market-hours re-sync overflows into another
-    /// re-sync. 0 = keep the built-in default.
+    /// re-sync. 0 = keep the built-in default. Applies to each book thread.
     pub replay_cache_events: usize,
+    /// Threads that apply events. The coins are split into this many groups,
+    /// each with its own books and its own thread; clients still see one
+    /// server. 1 applies everything on one thread. Capped at
+    /// [`MAX_BOOK_THREADS`].
+    pub book_threads: usize,
 }
+
+/// The most book threads a server will run.
+pub const MAX_BOOK_THREADS: usize = listeners::order_book::MAX_BOOK_THREADS;

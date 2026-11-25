@@ -57,6 +57,18 @@ impl<O: InnerOrder> Snapshot<O> {
         drop(self.extract_triggers());
     }
 
+    /// Would [`Self::extract_triggers`] return anything? Checked without changing the snapshot.
+    pub(crate) fn has_triggers(&self) -> bool {
+        let [bids, asks] = &self.0;
+        let on_both_sides = |last: Option<&O>, other: &[O]| {
+            last.is_some_and(|order| {
+                let oid = order.oid();
+                other.iter().any(|candidate| candidate.oid() == oid)
+            })
+        };
+        on_both_sides(bids.last(), asks) || on_both_sides(asks.last(), bids)
+    }
+
     /// Strips the untriggered trigger orders the hl-node snapshot appends to the
     /// tail of BOTH sides (same oid in each) and returns the popped copies.
     /// Callers that keep them should dedupe by oid — every trigger order yields

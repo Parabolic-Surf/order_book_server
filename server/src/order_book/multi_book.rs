@@ -19,13 +19,29 @@ impl<O> Snapshots<O> {
         self.0
     }
 
+    #[cfg(test)]
+    pub(crate) const fn as_ref_for_test(&self) -> &HashMap<Coin, Snapshot<O>> {
+        &self.0
+    }
+
     /// Drop every coin `keep` rejects, before any book is built for it.
     pub(crate) fn retain_coins(&mut self, keep: impl Fn(&Coin) -> bool) {
         self.0.retain(|coin, _| keep(coin));
     }
+
+    /// Move the coins `take` accepts out into their own set.
+    pub(crate) fn take_coins(&mut self, take: impl Fn(&Coin) -> bool) -> Self {
+        let coins: Vec<Coin> = self.0.keys().filter(|coin| take(coin)).cloned().collect();
+        Self(coins.into_iter().filter_map(|coin| self.0.remove_entry(&coin)).collect())
+    }
 }
 
 impl<O: InnerOrder> Snapshots<O> {
+    /// True when any coin's snapshot still carries trigger orders on its sides.
+    pub(crate) fn has_triggers(&self) -> bool {
+        self.0.values().any(Snapshot::has_triggers)
+    }
+
     /// Strip the untriggered trigger orders from every coin's snapshot and
     /// return them flattened. Each trigger order appears twice (once per side)
     /// — callers dedupe by oid. See [`Snapshot::extract_triggers`].

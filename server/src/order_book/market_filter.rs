@@ -4,6 +4,52 @@ use std::fmt;
 
 use super::Coin;
 
+/// One group of coins out of `count`. Each group's books are owned by one
+/// thread, so the work of applying events spreads over several cores. A coin
+/// always maps to the same group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ShardRoute {
+    index: usize,
+    count: usize,
+}
+
+impl ShardRoute {
+    /// The only group: owns every coin.
+    pub(crate) const SINGLE: Self = Self { index: 0, count: 1 };
+
+    pub(crate) fn new(index: usize, count: usize) -> Self {
+        assert!(count > 0 && index < count, "group {index} of {count}");
+        Self { index, count }
+    }
+
+    pub(crate) const fn index(self) -> usize {
+        self.index
+    }
+
+    pub(crate) const fn count(self) -> usize {
+        self.count
+    }
+
+    /// The group that owns `coin` when coins are split into `count` groups.
+    pub(crate) fn shard_of(coin: &str, count: usize) -> usize {
+        if count <= 1 {
+            return 0;
+        }
+        // FNV-1a: stable across runs and builds, unlike the std hasher.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in coin.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // The low bits of FNV are weak for short keys; fold the high half in.
+        ((hash ^ (hash >> 32)) % count as u64) as usize
+    }
+
+    pub(crate) fn owns(self, coin: &str) -> bool {
+        self.count == 1 || Self::shard_of(coin, self.count) == self.index
+    }
+}
+
 /// Selects the markets a server instance tracks. Events for every other market
 /// are skipped before they reach any book state, so several instances can read
 /// one node and each carry part of the load.
@@ -16,6 +62,8 @@ pub struct MarketFilter {
     hip3_dexes: Vec<String>,
     /// Nothing is filtered, so the hot path can skip classifying the coin.
     everything: bool,
+    /// The group of coins this copy of the filter is for.
+    shard: ShardRoute,
 }
 
 impl MarketFilter {
@@ -23,7 +71,7 @@ impl MarketFilter {
     #[must_use]
     pub const fn new(perps: bool, spot: bool, hip3: bool, hip3_dexes: Vec<String>) -> Self {
         let everything = perps && spot && hip3 && hip3_dexes.is_empty();
-        Self { perps, spot, hip3, hip3_dexes, everything }
+        Self { perps, spot, hip3, hip3_dexes, everything, shard: ShardRoute::SINGLE }
     }
 
     /// Every market: perps, spot and all HIP-3 dexes.
@@ -32,9 +80,23 @@ impl MarketFilter {
         Self::new(true, true, true, Vec::new())
     }
 
+    /// The same markets, narrowed to the coins one group owns.
+    pub(crate) fn for_shard(&self, shard: ShardRoute) -> Self {
+        Self { shard, ..self.clone() }
+    }
+
+    pub(crate) const fn shard(&self) -> ShardRoute {
+        self.shard
+    }
+
     /// True when events for `coin` should be applied and served.
     #[must_use]
     pub fn includes(&self, coin: &str) -> bool {
+        self.shard.owns(coin) && self.includes_market(coin)
+    }
+
+    /// The market rule alone, for any group.
+    pub(crate) fn includes_market(&self, coin: &str) -> bool {
         if self.everything {
             return true;
         }
@@ -61,6 +123,11 @@ impl MarketFilter {
     #[must_use]
     pub const fn tracks_everything(&self) -> bool {
         self.everything
+    }
+
+    /// True when this filter drops nothing at all: every market, one group.
+    pub(crate) const fn passes_everything(&self) -> bool {
+        self.everything && self.shard.count == 1
     }
 }
 
@@ -164,5 +231,65 @@ mod tests {
         assert!(!filter.includes("xyz:AMD"));
         assert!(!filter.includes("BTC"));
         assert!(filter.includes_spot());
+    }
+
+    const COINS: [&str; 12] =
+        ["BTC", "ETH", "SOL", "HYPE", "kPEPE", "DOGE", "xyz:AMD", "xyz:NVDA", "xyz:GOLD", "io:GOLD", "@107", "PURR/USDC"];
+
+    #[test]
+    fn every_coin_belongs_to_exactly_one_group() {
+        for count in 1..=8 {
+            for coin in COINS {
+                let owners = (0..count).filter(|&index| ShardRoute::new(index, count).owns(coin)).count();
+                assert_eq!(owners, 1, "{coin} with {count} groups");
+                assert!(ShardRoute::shard_of(coin, count) < count);
+            }
+        }
+    }
+
+    #[test]
+    fn group_assignment_is_fixed() {
+        // The dispatcher and every group must agree across restarts and builds,
+        // so the mapping is pinned here; a change to the hash shows up as a failure.
+        let got: Vec<usize> = ["BTC", "ETH", "xyz:AMD"].iter().map(|coin| ShardRoute::shard_of(coin, 4)).collect();
+        assert_eq!(got, vec![1, 1, 0]);
+        assert_eq!(ShardRoute::shard_of("BTC", 1), 0);
+        assert_eq!(ShardRoute::shard_of("BTC", 0), 0);
+    }
+
+    #[test]
+    fn groups_split_coins_roughly_evenly() {
+        let names: Vec<String> = (0..2000).map(|i| format!("COIN{i}")).collect();
+        for count in [2_usize, 3, 4, 8] {
+            let mut sizes = vec![0_usize; count];
+            for name in &names {
+                sizes[ShardRoute::shard_of(name, count)] += 1;
+            }
+            let expected = names.len() / count;
+            for size in sizes {
+                assert!(size > expected * 8 / 10 && size < expected * 12 / 10, "{size} of {expected} with {count} groups");
+            }
+        }
+    }
+
+    #[test]
+    fn a_group_filter_keeps_the_market_rule_and_its_own_coins_only() {
+        let markets = MarketFilter::new(true, false, true, vec!["xyz".to_string()]);
+        let groups: Vec<MarketFilter> = (0..3).map(|index| markets.for_shard(ShardRoute::new(index, 3))).collect();
+        for coin in COINS {
+            let owners = groups.iter().filter(|group| group.includes(coin)).count();
+            assert_eq!(owners, usize::from(markets.includes(coin)), "{coin}");
+            assert!(groups.iter().all(|group| group.includes_market(coin) == markets.includes(coin)));
+        }
+        assert_eq!(groups[1].shard(), ShardRoute::new(1, 3));
+        assert_eq!(markets.shard(), ShardRoute::SINGLE);
+    }
+
+    #[test]
+    fn only_an_unfiltered_single_group_passes_everything() {
+        assert!(MarketFilter::all().passes_everything());
+        assert!(!MarketFilter::all().for_shard(ShardRoute::new(0, 2)).passes_everything());
+        assert!(MarketFilter::all().for_shard(ShardRoute::new(0, 2)).tracks_everything());
+        assert!(!MarketFilter::new(true, false, true, Vec::new()).passes_everything());
     }
 }

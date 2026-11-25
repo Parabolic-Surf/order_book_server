@@ -158,9 +158,32 @@ What a filtered instance serves:
 - A request for an untracked coin behaves like a request for an unknown coin.
 - An instance whose filter matches no market in the node snapshot (a mistyped dex name, for example) exits at startup instead of running empty.
 
+### Book threads
+
+By default every book update is applied by one thread, which limits a server to one core. `--book-threads N` divides the coins into N groups and gives each group its own books and its own thread:
+
+```bash
+orderbook_server --markets perps,hip3 --hip3-dexes xyz --book-threads 3 ...
+```
+
+Clients see no difference: one address, the same channels, the same messages.
+
+How it works:
+
+- A coin belongs to one group, chosen by a hash of its name. The assignment is fixed, so it is the same after a restart.
+- One reader parses the node's files and hands each event to the group that owns its coin. Events of one coin stay in order.
+- A request for one coin's book locks only that coin's group; the other groups keep applying.
+- At startup and at a re-sync, groups that need a node snapshot at the same time share a single dump.
+
+Sizing:
+
+- Give the server at least N + 2 cores: the groups, the reader, and the threads that serve connections.
+- The groups are equal in coins, not in load, so the busiest coins set the peak. Check per-thread CPU (`top -H`, threads `book-0`, `book-1`, ...) before settling on N.
+- `--replay-cache-events` is a cap per thread.
+
 #### Splitting the load across instances
 
-All book updates are applied by one task, so a single instance is limited by one core. Two instances reading the same node each apply only their own markets:
+Book threads are the simple way to use more cores. Separate instances are still possible, for example to keep markets on different hosts. Two instances reading the same node each apply only their own markets:
 
 ```bash
 # Perps on port 8000
@@ -183,6 +206,7 @@ Rules for running more than one instance on a host:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--metrics-port` | `9090` | Prometheus metrics port (0 to disable) |
+| `--book-threads` | `1` | Threads that apply book updates, 1 to 16. The coins are split into that many groups. See [Book threads](#book-threads) |
 | `--bbo-only` | `false` | Lightweight BBO-only mode (~100 MB RAM, vs ~1 GB for full markets). Disables L2/L4/Trades subscriptions |
 | `--l2book-heartbeat-ms` | `0` | If > 0, resend the last `l2Book` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |
 | `--bbo-heartbeat-ms` | `0` | If > 0, resend the last `bbo` payload for each active subscription every N ms when nothing has changed. See [Heartbeats](#heartbeats) |

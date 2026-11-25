@@ -1,14 +1,14 @@
 use crate::{
     listeners::order_book::{
-        ActiveL2Params, ActiveSubGuard, ActiveSubs, CoinBbo, InternalMessage, L2FrameCache, L2FrameKey, L2ParamGuard,
-        L2SnapshotParams, OrderBookListener, hl_listen_hft,
+        ActiveL2Params, ActiveSubGuard, ActiveSubs, BookShards, CoinBbo, InternalMessage, L2FrameCache, L2FrameKey,
+        L2ParamGuard, L2SnapshotParams, hl_listen_hft,
     },
     metrics::{
         BBO_CHANGES_TOTAL, BROADCAST_RECEIVERS, BROADCASTS_TOTAL, CHANNEL_DROPS_TOTAL, CHANNEL_LAG,
         LAST_EVENT_APPLIED_MS, MESSAGES_SENT_TOTAL, ORDERBOOK_HEIGHT, ORDERBOOK_READY, WS_CONNECTIONS_ACTIVE,
         WS_CONNECTIONS_TOTAL, WS_SEND_ERRORS_TOTAL,
     },
-    order_book::{Coin, PxBand, Snapshot},
+    order_book::{Coin, PxBand, Snapshot, market_filter::ShardRoute},
     prelude::*,
     types::{
         Bbo, L2Book, L4Book, L4BookUpdates, L4Order,
@@ -28,7 +28,6 @@ use tokio::select;
 use tokio::{
     net::TcpListener,
     sync::{
-        Mutex,
         broadcast::{Sender, channel},
         mpsc,
     },
@@ -123,25 +122,29 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     // acquires/releases refcounted guards on subscribe/unsubscribe + disconnect).
     let active_l2_params = ActiveL2Params::new();
 
-    // Resolve data directory
-    // Central task: listen to messages and forward them for distribution
-    let listener = {
-        let internal_message_tx = internal_message_tx.clone();
-        let mut listener =
-            OrderBookListener::new(Some(internal_message_tx), markets, active_l2_params.clone());
-        listener.set_tolerate_drift(config.no_resync);
-        // BBO-only deployments are sized for a lightweight envelope and have no
-        // consumers for /untriggeredOrders - skip maintaining the side table.
-        listener.set_track_untriggered(!config.bbo_only);
-        listener
+    // The books, split into groups of coins with one apply thread each. Every
+    // group broadcasts on the same channel, so connections see one feed.
+    let books = {
+        let (no_resync, bbo_only) = (config.no_resync, config.bbo_only);
+        BookShards::new(
+            config.book_threads,
+            Some(internal_message_tx.clone()),
+            markets,
+            active_l2_params.clone(),
+            move |listener| {
+                listener.set_tolerate_drift(no_resync);
+                // BBO-only deployments are sized for a lightweight envelope and have no
+                // consumers for /untriggeredOrders - skip maintaining the side table.
+                listener.set_track_untriggered(!bbo_only);
+            },
+        )
     };
-    let listener = Arc::new(Mutex::new(listener));
     let listener_task = {
-        let listener = listener.clone();
+        let books = books.clone();
         let config = config.clone();
         tokio::spawn(async move {
             info!("Starting HFT-optimized listener");
-            let result = hl_listen_hft(listener, config).await;
+            let result = hl_listen_hft(books, config).await;
             if let Err(err) = result {
                 error!("Listener fatal error: {err}");
                 std::process::exit(1);
@@ -169,13 +172,13 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
                 let bbo_only = config.bbo_only;
                 let l2book_heartbeat_ms = config.l2book_heartbeat_ms;
                 let bbo_heartbeat_ms = config.bbo_heartbeat_ms;
-                let listener = listener.clone();
+                let books = books.clone();
                 let l4_cache = l4_cache.clone();
                 move |ws_upgrade| async move {
                     ws_handler(
                         ws_upgrade,
                         internal_message_tx.clone(),
-                        listener.clone(),
+                        books.clone(),
                         l4_cache.clone(),
                         bbo_only,
                         l2book_heartbeat_ms,
@@ -188,18 +191,18 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
         .route(
             "/l4Book",
             get({
-                let listener = listener.clone();
+                let books = books.clone();
                 let l4_cache = l4_cache.clone();
-                move |query, headers| l4_snapshot_handler(query, headers, listener.clone(), l4_cache.clone())
+                move |query, headers| l4_snapshot_handler(query, headers, books.clone(), l4_cache.clone())
             }),
         )
         .route(
             "/untriggeredOrders",
             get({
-                let listener = listener.clone();
+                let books = books.clone();
                 let untriggered_cache = untriggered_cache.clone();
                 move |query, headers| {
-                    untriggered_orders_handler(query, headers, listener.clone(), untriggered_cache.clone())
+                    untriggered_orders_handler(query, headers, books.clone(), untriggered_cache.clone())
                 }
             }),
         )
@@ -318,7 +321,7 @@ impl axum::serve::Listener for NoDelayListener {
 fn ws_handler(
     incoming: yawc::IncomingUpgrade,
     internal_message_tx: Sender<Arc<InternalMessage>>,
-    listener: Arc<Mutex<OrderBookListener>>,
+    books: BookShards,
     l4_cache: Arc<L4SnapshotCache>,
     bbo_only: bool,
     l2book_heartbeat_ms: u64,
@@ -344,7 +347,7 @@ fn ws_handler(
             }
         };
 
-        handle_socket(ws, internal_message_tx, listener, l4_cache, bbo_only, l2book_heartbeat_ms, bbo_heartbeat_ms)
+        handle_socket(ws, internal_message_tx, books, l4_cache, bbo_only, l2book_heartbeat_ms, bbo_heartbeat_ms)
             .await;
     });
 
@@ -355,7 +358,7 @@ fn ws_handler(
 async fn handle_socket(
     socket: WebSocket,
     internal_message_tx: Sender<Arc<InternalMessage>>,
-    listener: Arc<Mutex<OrderBookListener>>,
+    books: BookShards,
     l4_cache: Arc<L4SnapshotCache>,
     bbo_only: bool,
     l2book_heartbeat_ms: u64,
@@ -377,13 +380,11 @@ async fn handle_socket(
 
     let mut internal_message_rx = internal_message_tx.subscribe();
     BROADCAST_RECEIVERS.set(internal_message_tx.receiver_count() as i64);
-    // One lock hold for all setup state (previously four separate acquisitions:
-    // during a reconnect storm every new connection queued four times behind
-    // the FIFO-fair listener lock, exactly when it was most contended).
-    let (is_ready, mut universe, active_l2_params, active_subs) = {
-        let listener_state = listener.lock().await;
-        (listener_state.is_ready(), listener_state.universe(), listener_state.active_l2_params(), listener_state.active_subs())
-    };
+    // Setup state. Readiness and the universe take each group's lock once; the
+    // two registries are shared by all groups and need no lock.
+    let is_ready = books.is_ready().await;
+    let mut universe = books.universe().await;
+    let (active_l2_params, active_subs) = (books.active_l2_params(), books.active_subs());
     let mut manager = SubscriptionManager::default();
     // `universe` above: market-filtered universe for subscription validation.
     // Refreshed from Snapshot broadcasts (Arc-shared, built once in the
@@ -433,7 +434,7 @@ async fn handle_socket(
             &mut l2_param_guards,
             &active_subs,
             &mut sub_guards,
-            &listener,
+            &books,
             &l4_cache,
             bbo_only,
             l2book_heartbeat_ms,
@@ -472,7 +473,7 @@ async fn run_session(
     l2_param_guards: &mut HashMap<L2SnapshotParams, L2ParamGuard>,
     active_subs: &ActiveSubs,
     sub_guards: &mut HashMap<Subscription, Vec<ActiveSubGuard>>,
-    listener: &Arc<Mutex<OrderBookListener>>,
+    books: &BookShards,
     l4_cache: &Arc<L4SnapshotCache>,
     bbo_only: bool,
     l2book_heartbeat_ms: u64,
@@ -491,25 +492,28 @@ async fn run_session(
     // Set after a broadcast-channel lag: a dropped Snapshot message may have
     // carried dirty coins this connection never saw, so the next Snapshot must
     // re-evaluate every subscription instead of trusting the dirty-set skip.
-    let mut force_full_l2 = false;
+    // Kept per group: each group's Snapshot covers only its own coins.
+    let mut force_full_l2 = vec![false; books.count()];
     while alive {
         select! {
             recv_result = internal_message_rx.recv() => {
                 match recv_result {
                     Ok(msg) => {
                         match msg.as_ref() {
-                            InternalMessage::Snapshot{ l2_snapshots, time, dirty, universe: new_universe, l2_frames } => {
+                            InternalMessage::Snapshot{ shard, l2_snapshots, time, dirty, universe: new_universe, l2_frames } => {
                                 if let Some(u) = new_universe {
                                     *universe = Arc::clone(u);
                                 }
+                                let force_full = force_full_l2.get(shard.index()).copied().unwrap_or(false);
                                 for sub in manager.subscriptions() {
                                     if !alive { break; }
-                                    // Skip BBO subs here - they get fast updates via BboUpdate
-                                    if !matches!(sub, Subscription::Bbo { .. }) {
-                                        alive &= send_ws_data_from_snapshot(outbound, sub, l2_snapshots.as_ref(), *time, last_l2, dirty, force_full_l2, l2_frames, l2_hb.is_some()).await;
+                                    if snapshot_serves(*shard, sub) {
+                                        alive &= send_ws_data_from_snapshot(outbound, sub, l2_snapshots.as_ref(), *time, last_l2, dirty, force_full, l2_frames, l2_hb.is_some()).await;
                                     }
                                 }
-                                force_full_l2 = false;
+                                if let Some(pending) = force_full_l2.get_mut(shard.index()) {
+                                    *pending = false;
+                                }
                             },
                             InternalMessage::BboUpdate{ bbos, time } => {
                                 // Fast path for BBO subscribers only
@@ -598,7 +602,7 @@ async fn run_session(
                         // A dropped Snapshot may have carried dirty coins we never
                         // saw - process the next one in full (hash dedup still
                         // suppresses sends whose payload didn't actually change).
-                        force_full_l2 = true;
+                        force_full_l2.fill(true);
                         log::debug!("Receiver lagged: {n} messages");
                     }
                     Err(err) => {
@@ -682,7 +686,7 @@ async fn run_session(
                                         alive &= outbound.send_pong();
                                     }
                                     _ => {
-                                        alive &= receive_client_message(outbound, manager, value, universe.as_ref(), listener.clone(), l4_cache, bbo_only, last_l2, last_bbo, active_l2_params, l2_param_guards, active_subs, sub_guards).await;
+                                        alive &= receive_client_message(outbound, manager, value, universe.as_ref(), books.clone(), l4_cache, bbo_only, last_l2, last_bbo, active_l2_params, l2_param_guards, active_subs, sub_guards).await;
                                     }
                                 }
                             }
@@ -721,7 +725,7 @@ async fn receive_client_message(
     manager: &mut SubscriptionManager,
     client_message: ClientMessage,
     universe: &HashSet<String>,
-    listener: Arc<Mutex<OrderBookListener>>,
+    books: BookShards,
     l4_cache: &Arc<L4SnapshotCache>,
     bbo_only: bool,
     last_l2: &mut HashMap<String, L2Entry>,
@@ -812,7 +816,7 @@ async fn receive_client_message(
     };
     if success {
         let snapshot_msg = if let ClientMessage::Subscribe { subscription } = &client_message {
-            let msg = subscription.handle_immediate_snapshot(listener, l4_cache).await;
+            let msg = subscription.handle_immediate_snapshot(books, l4_cache).await;
             match msg {
                 Ok(msg) => msg,
                 Err(err) => {
@@ -1012,6 +1016,14 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Is `sub` served from a Snapshot message of group `shard`? Only L2 books are
+/// (BBO has its own faster message), and only for that group's coins: any other
+/// coin is absent from the message because it lives in another group, and
+/// reading that as an emptied book would wipe the client's view of it.
+fn snapshot_serves(shard: ShardRoute, sub: &Subscription) -> bool {
+    matches!(sub, Subscription::L2Book { coin, .. } if shard.owns(coin))
+}
+
 async fn send_ws_data_from_snapshot(
     outbound: &Outbound,
     subscription: &Subscription,
@@ -1098,11 +1110,11 @@ impl Subscription {
     // snapshots that begin a stream
     async fn handle_immediate_snapshot(
         &self,
-        listener: Arc<Mutex<OrderBookListener>>,
+        books: BookShards,
         l4_cache: &Arc<L4SnapshotCache>,
     ) -> Result<Option<bytes::Bytes>> {
         if let Self::L4Book { coin } = self {
-            if let Some(body) = l4_snapshot_body(l4_cache, &listener, coin, PxBand::default()).await? {
+            if let Some(body) = l4_snapshot_body(l4_cache, &books, coin, PxBand::default()).await? {
                 return Ok(Some(l4_ws_frame(&body)));
             }
             return Err("Snapshot Failed".into());
@@ -1207,7 +1219,7 @@ impl L4SnapshotCache {
 /// wedge async runtime workers. `Ok(None)` when the coin has no book.
 async fn l4_snapshot_body(
     cache: &Arc<L4SnapshotCache>,
-    listener: &Arc<Mutex<OrderBookListener>>,
+    books: &BookShards,
     coin: &str,
     band: PxBand,
 ) -> Result<Option<bytes::Bytes>> {
@@ -1222,7 +1234,8 @@ async fn l4_snapshot_body(
         return Ok(Some(body));
     }
 
-    let snapshot = listener.lock().await.compute_snapshot_for_coin(&Coin::new(coin), band);
+    // Only the group that owns the coin is asked, so the other groups keep applying.
+    let snapshot = books.for_coin(coin).lock().await.compute_snapshot_for_coin(&Coin::new(coin), band);
     let Some((time, height, coin_snapshot)) = snapshot else {
         return Ok(None);
     };
@@ -1257,7 +1270,7 @@ struct L4SnapshotQuery {
 async fn l4_snapshot_handler(
     axum::extract::Query(query): axum::extract::Query<L4SnapshotQuery>,
     headers: axum::http::HeaderMap,
-    listener: Arc<Mutex<OrderBookListener>>,
+    books: BookShards,
     l4_cache: Arc<L4SnapshotCache>,
 ) -> axum::response::Response {
     fn json_response(status: axum::http::StatusCode, body: String) -> axum::response::Response {
@@ -1277,7 +1290,7 @@ async fn l4_snapshot_handler(
             );
         }
     };
-    match l4_snapshot_body(&l4_cache, &listener, &query.coin, band).await {
+    match l4_snapshot_body(&l4_cache, &books, &query.coin, band).await {
         Ok(Some(body)) => {
             // Order JSON compresses ~10x; without this, transfer time
             // dwarfs the build for remote clients pulling MB-scale
@@ -1366,7 +1379,7 @@ struct UntriggeredOrders {
 /// on a blocking thread. `Ok(None)` until the first snapshot install.
 async fn untriggered_body(
     cache: &Arc<L4SnapshotCache>,
-    listener: &Arc<Mutex<OrderBookListener>>,
+    books: &BookShards,
     coin: Option<&str>,
 ) -> Result<Option<bytes::Bytes>> {
     // Reuses the l4 cache's (String, PxBand) key with a default band; ""
@@ -1381,7 +1394,7 @@ async fn untriggered_body(
     }
 
     let filter_coin = coin.map(Coin::new);
-    let snapshot = listener.lock().await.compute_untriggered_snapshot(filter_coin.as_ref());
+    let snapshot = books.untriggered_snapshot(filter_coin.as_ref()).await;
     let Some((time, height, mut orders)) = snapshot else {
         return Ok(None);
     };
@@ -1417,7 +1430,7 @@ async fn untriggered_body(
 async fn untriggered_orders_handler(
     axum::extract::Query(query): axum::extract::Query<UntriggeredQuery>,
     headers: axum::http::HeaderMap,
-    listener: Arc<Mutex<OrderBookListener>>,
+    books: BookShards,
     cache: Arc<L4SnapshotCache>,
 ) -> axum::response::Response {
     fn json_response(status: axum::http::StatusCode, body: String) -> axum::response::Response {
@@ -1438,7 +1451,7 @@ async fn untriggered_orders_handler(
         );
     }
 
-    match untriggered_body(&cache, &listener, query.coin.as_deref()).await {
+    match untriggered_body(&cache, &books, query.coin.as_deref()).await {
         Ok(Some(body)) => {
             let accepts_gzip = headers
                 .get(axum::http::header::ACCEPT_ENCODING)
@@ -1761,5 +1774,21 @@ mod tests {
         assert_eq!(q.max_px.as_deref(), Some("66000"));
         let bare: L4SnapshotQuery = serde_json::from_str(r#"{"coin":"BTC"}"#).unwrap();
         assert!(bare.min_px.is_none() && bare.max_px.is_none());
+    }
+
+    #[test]
+    fn test_a_group_snapshot_serves_only_l2_books_of_its_own_coins() {
+        let l2 = |coin: &str| Subscription::L2Book { coin: coin.to_string(), n_sig_figs: None, n_levels: None, mantissa: None };
+        for coin in ["BTC", "ETH", "xyz:AMD", "@107"] {
+            let owner = ShardRoute::shard_of(coin, 3);
+            for index in 0..3 {
+                // Served by another group's message, the absent coin would go out as an empty book.
+                assert_eq!(snapshot_serves(ShardRoute::new(index, 3), &l2(coin)), index == owner, "{coin} group {index}");
+            }
+            assert!(snapshot_serves(ShardRoute::SINGLE, &l2(coin)));
+        }
+        let owner = ShardRoute::new(ShardRoute::shard_of("BTC", 3), 3);
+        assert!(!snapshot_serves(owner, &Subscription::Bbo { coin: "BTC".to_string() }));
+        assert!(!snapshot_serves(owner, &Subscription::Trades { coin: "BTC".to_string() }));
     }
 }

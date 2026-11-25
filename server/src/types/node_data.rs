@@ -130,6 +130,20 @@ impl<E> Batch<E> {
         self.events.retain(keep);
         before - self.events.len()
     }
+
+    /// Split into `parts` batches of the same block, moving each event to the
+    /// part `part_of` names and keeping the order within a part. A part with
+    /// no event is still returned, so every part sees the block.
+    pub(crate) fn split_events(self, parts: usize, part_of: impl Fn(&E) -> usize) -> Vec<Self> {
+        let Self { local_time, block_time, block_number, events } = self;
+        let mut split: Vec<Self> =
+            (0..parts).map(|_| Self { local_time, block_time, block_number, events: Vec::new() }).collect();
+        for event in events {
+            let part = part_of(&event);
+            split[part].events.push(event);
+        }
+        split
+    }
 }
 
 #[cfg(test)]
