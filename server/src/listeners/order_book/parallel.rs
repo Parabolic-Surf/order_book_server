@@ -115,6 +115,16 @@ impl FileReader {
         std::mem::take(&mut self.desynced)
     }
 
+    /// Is `path` one of the node's stream files, `<base>/hourly/<day>/<hour>`?
+    /// The node also creates short-lived entries directly under `<base>` when
+    /// it starts; following one of those froze the stream until a restart.
+    fn is_stream_file(&self, path: &std::path::Path) -> bool {
+        let Ok(relative) = path.strip_prefix(self.base_dir.join("hourly")) else {
+            return false;
+        };
+        relative.components().count() == 2 && path.is_file()
+    }
+
     /// Every streaming file, newest first: day directories (YYYYMMDD -
     /// lexicographic order is chronological) descending, files within a day by
     /// mtime descending. Only the two most recent days are considered - the
@@ -303,6 +313,12 @@ impl FileReader {
         if let Some(latest) = self.find_latest_file() {
             if let Some(ref current) = self.current_path {
                 if latest != *current {
+                    // The tracked file is gone (pruned, or never a stream file):
+                    // nothing more can be read from it, and lines may have been missed.
+                    if current.metadata().is_err() {
+                        self.desynced = true;
+                        return Some(latest);
+                    }
                     // Check if the new file has data (modification time is newer)
                     if let (Ok(latest_meta), Ok(current_meta)) = (latest.metadata(), current.metadata()) {
                         if let (Ok(latest_mtime), Ok(current_mtime)) = (latest_meta.modified(), current_meta.modified())
@@ -577,7 +593,7 @@ pub(super) fn spawn_file_watcher(
                 Ok(Ok(event)) => {
                     if event.kind.is_create() || event.kind.is_modify() {
                         let path = &event.paths[0];
-                        if path.is_dir() {
+                        if !reader.is_stream_file(path) {
                             continue;
                         }
 
@@ -1047,6 +1063,44 @@ mod tests {
         }));
         assert!(emitted.is_empty());
         assert!(reader.current_path.is_none(), "live tracking still starts on the first inotify event");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_only_hour_files_under_hourly_are_stream_files() {
+        let dir = test_dir("stream_file");
+        let day = dir.join("hourly").join("20261125");
+        std::fs::create_dir_all(&day).unwrap();
+        append(&day.join("20"), "x\n");
+        // What the node leaves directly under the stream folder when it starts.
+        append(&dir.join("20261125"), "x\n");
+        let reader = FileReader::new(dir.clone());
+
+        assert!(reader.is_stream_file(&day.join("20")));
+        assert!(!reader.is_stream_file(&dir.join("20261125")), "an entry outside hourly/ is not a stream file");
+        assert!(!reader.is_stream_file(&day), "a day folder is not a stream file");
+        assert!(!reader.is_stream_file(&day.join("21")), "a file that does not exist is not a stream file");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_a_vanished_tracked_file_is_replaced_and_reported() {
+        let dir = test_dir("vanished");
+        let day = dir.join("hourly").join("20261125");
+        std::fs::create_dir_all(&day).unwrap();
+        let hour = day.join("20");
+        append(&hour, "{\"a\":1}\n");
+
+        // The reader ended up on a path that is gone, as after a node restart.
+        let mut reader = FileReader::new(dir.clone());
+        reader.start_tracking(&dir.join("20261125"));
+        assert!(reader.on_modify().is_empty());
+
+        assert_eq!(reader.check_for_newer_file(), Some(hour.clone()));
+        assert!(reader.take_desynced(), "lines may have been missed while the reader was stuck");
+
+        reader.on_create(&hour);
+        assert_eq!(reader.on_modify(), vec!["{\"a\":1}".to_string()]);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
