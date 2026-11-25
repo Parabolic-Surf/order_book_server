@@ -18,6 +18,11 @@ impl<O> Snapshots<O> {
     pub(crate) fn value(self) -> HashMap<Coin, Snapshot<O>> {
         self.0
     }
+
+    /// Drop every coin `keep` rejects, before any book is built for it.
+    pub(crate) fn retain_coins(&mut self, keep: impl Fn(&Coin) -> bool) {
+        self.0.retain(|coin, _| keep(coin));
+    }
 }
 
 impl<O: InnerOrder> Snapshots<O> {

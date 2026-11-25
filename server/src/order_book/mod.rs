@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 
 pub(crate) mod levels;
 mod linked_list;
+pub(crate) mod market_filter;
 pub(crate) mod multi_book;
 mod price_level;
 pub(crate) mod types;

@@ -77,7 +77,13 @@ impl Coin {
         self.0.clone()
     }
 
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Returns true for spot markets: @ prefixed coins and PURR/USDC
+    // Production code classifies through `MarketFilter`; these stay for the tests.
+    #[cfg(test)]
     pub(crate) fn is_spot(&self) -> bool {
         Self::str_is_spot(&self.0)
     }
@@ -90,11 +96,13 @@ impl Coin {
 
     /// Returns true for HIP-3 markets: coins with colon format (X:Y)
     /// Examples: flx:COIN, xyz:AMD, abc:XYZ
+    #[cfg(test)]
     pub(crate) fn is_hip3(&self) -> bool {
         self.0.contains(':')
     }
 
     /// Returns true for perpetual futures (not spot, not hip3)
+    #[cfg(test)]
     pub(crate) fn is_perp(&self) -> bool {
         !self.is_spot() && !self.is_hip3()
     }

@@ -1,7 +1,7 @@
 use crate::{
     listeners::order_book::state::OrderBookState,
     metrics::{
-        BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
+        BBO_BROADCAST_LATENCY, EVENT_PROCESSING_LATENCY, EVENTS_FILTERED_TOTAL, EVENTS_PROCESSED_TOTAL, FILE_EVENTS_TOTAL,
         FILE_LINES_PARSED_TOTAL, INSERT_BEFORE_FALLBACK_TOTAL, L2_BROADCAST_LATENCY, L2_CONFLATION_BATCH_SIZE,
         LAST_EVENT_APPLIED_MS, LISTENER_LOCK_WAIT, ORDERBOOK_COINS_COUNT, ORDERBOOK_DESYNCS_TOTAL, ORDERBOOK_HEIGHT,
         ORDERBOOK_ORDERS_TOTAL, ORDERBOOK_READY, ORDERBOOK_RESYNC_IN_FLIGHT, ORDERBOOK_TIME_MS,
@@ -10,6 +10,7 @@ use crate::{
     },
     order_book::{
         Coin, Px, PxBand, Side, Snapshot, Sz,
+        market_filter::MarketFilter,
         multi_book::{Snapshots, load_snapshots_from_cli_json},
     },
     prelude::*,
@@ -195,9 +196,9 @@ async fn install_snapshot_phased_impl(
     residual_events_max: usize,
     max_chase_rounds: usize,
 ) -> Result<()> {
-    let (ignore_spot, track_untriggered) = {
+    let (markets, track_untriggered) = {
         let guard = listener.lock().await;
-        (guard.ignore_spot, guard.track_untriggered)
+        (guard.markets.clone(), guard.track_untriggered)
     };
 
     // Phase 1 - build: pure CPU over every coin/order in the market. Run on a
@@ -205,7 +206,7 @@ async fn install_snapshot_phased_impl(
     // runtime worker that connection tasks need.
     let build_start = Instant::now();
     let mut new_state = tokio::task::spawn_blocking(move || {
-        OrderBookState::from_snapshot(snapshot, untriggered, height, 0, true, ignore_spot, track_untriggered)
+        OrderBookState::from_snapshot(snapshot, untriggered, height, 0, true, markets, track_untriggered)
     })
     .await?;
     let build_elapsed = build_start.elapsed();
@@ -319,10 +320,10 @@ fn replay_batch_above(state: &mut OrderBookState, batch: EventBatch, height: u64
 }
 
 pub(crate) struct OrderBookListener {
-    ignore_spot: bool,
-    // (include_perps, include_spot, include_hip3) - used to filter the universe
-    // handed to connections for subscription validation.
-    market_filter: (bool, bool, bool),
+    // Markets this instance tracks. Events for any other market are skipped in
+    // the apply path, and its coins are left out of the universe handed to
+    // connections for subscription validation.
+    markets: MarketFilter,
     // None if we haven't seen a valid snapshot yet
     order_book_state: Option<OrderBookState>,
     // Some while a snapshot fetch is in flight (initial startup and re-syncs):
@@ -398,13 +399,11 @@ pub(crate) struct OrderBookListener {
 impl OrderBookListener {
     pub(crate) fn new(
         internal_message_tx: Option<Sender<Arc<InternalMessage>>>,
-        ignore_spot: bool,
+        markets: MarketFilter,
         active_l2_params: ActiveL2Params,
-        market_filter: (bool, bool, bool),
     ) -> Self {
         Self {
-            ignore_spot,
-            market_filter,
+            markets,
             order_book_state: None,
             // Cache from the very first event: the initial snapshot fetch hasn't
             // started yet, and anything arriving before it completes must be
@@ -461,12 +460,12 @@ impl OrderBookListener {
     /// validation. Connections receive refreshed copies via `Snapshot` broadcasts
     /// whenever the coin set changes.
     pub(crate) fn universe(&self) -> Arc<HashSet<String>> {
-        let market_filter = self.market_filter;
+        let markets = &self.markets;
         Arc::new(self.order_book_state.as_ref().map_or_else(HashSet::new, |state| {
             state
                 .compute_universe()
                 .into_iter()
-                .filter(|coin| coin_in_market_filter(coin, market_filter))
+                .filter(|coin| markets.includes_coin(coin))
                 .map(|coin| coin.value())
                 .collect()
         }))
@@ -547,7 +546,7 @@ impl OrderBookListener {
             height,
             0,
             true,
-            self.ignore_spot,
+            self.markets.clone(),
             self.track_untriggered,
         );
         // Mirror the production carry-forward (install_snapshot_phased_impl):
@@ -691,11 +690,6 @@ impl OrderBookListener {
     ) -> Option<(u64, u64, Vec<std::sync::Arc<InnerL4Order>>)> {
         self.order_book_state.as_ref().map(|state| state.untriggered_snapshot(coin))
     }
-}
-
-/// Does `coin` belong to one of the enabled market types?
-fn coin_in_market_filter(coin: &Coin, (include_perps, include_spot, include_hip3): (bool, bool, bool)) -> bool {
-    (coin.is_perp() && include_perps) || (coin.is_spot() && include_spot) || (coin.is_hip3() && include_hip3)
 }
 
 /// Parse one streaming line into (block height, typed event batch). Runs WITHOUT
@@ -921,14 +915,42 @@ impl TradePairer {
     }
 }
 
+/// Default snapshot file for direct mode, named after the listen port so two
+/// instances on one host never write the same file. Docker mode keeps its own
+/// default: the dump path inside the container is fixed there.
+fn default_direct_snapshot_path(mode: crate::SnapshotMode, address: &str) -> Option<std::path::PathBuf> {
+    if mode != crate::SnapshotMode::Direct {
+        return None;
+    }
+    let port = address.rsplit(':').next().filter(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))?;
+    Some(std::path::PathBuf::from(format!("/tmp/hl_snapshot_{port}.json")))
+}
+
+/// Drop the events of markets this instance does not track, so they are never
+/// cached for replay, grouped for broadcast or applied. The batch is kept even
+/// when it ends up empty: its block height and time still advance the book.
+fn strip_untracked_events(event_batch: &mut EventBatch, markets: &MarketFilter) {
+    if markets.tracks_everything() {
+        return;
+    }
+    let (dropped, kind) = match event_batch {
+        EventBatch::Orders(batch) => (batch.retain_events(|status| markets.includes(&status.order.coin)), "orders"),
+        EventBatch::BookDiffs(batch) => (batch.retain_events(|diff| markets.includes(diff.coin_str())), "diffs"),
+        EventBatch::Fills(batch) => (batch.retain_events(|fill| markets.includes(&fill.1.coin)), "fills"),
+    };
+    if dropped > 0 {
+        EVENTS_FILTERED_TOTAL.with_label_values(&[kind]).inc_by(dropped as u64);
+    }
+}
+
 /// Group order diffs per coin (one clone per event - the batch itself is
-/// consumed by the state apply). `skip_spot` folds the `--markets` filtering
+/// consumed by the state apply). `markets` folds the `--markets` filtering
 /// in, replacing the old whole-batch `filter_events` clone.
-fn group_diffs_by_coin(events: &[NodeDataOrderDiff], skip_spot: bool) -> HashMap<String, CoinDiffs> {
+fn group_diffs_by_coin(events: &[NodeDataOrderDiff], markets: &MarketFilter) -> HashMap<String, CoinDiffs> {
     let mut by_coin: HashMap<String, Vec<NodeDataOrderDiff>> = HashMap::new();
     for diff in events {
         let coin = diff.coin();
-        if skip_spot && coin.is_spot() {
+        if !markets.includes_coin(&coin) {
             continue;
         }
         by_coin.entry(coin.value()).or_default().push(diff.clone());
@@ -945,9 +967,12 @@ fn group_diffs_by_coin(events: &[NodeDataOrderDiff], skip_spot: bool) -> HashMap
 }
 
 /// Group order statuses per coin (one clone per event).
-fn group_statuses_by_coin(events: &[NodeDataOrderStatus]) -> HashMap<String, CoinStatuses> {
+fn group_statuses_by_coin(events: &[NodeDataOrderStatus], markets: &MarketFilter) -> HashMap<String, CoinStatuses> {
     let mut by_coin: HashMap<String, Vec<NodeDataOrderStatus>> = HashMap::new();
     for status in events {
+        if !markets.includes(&status.order.coin) {
+            continue;
+        }
         by_coin.entry(status.order.coin.clone()).or_default().push(status.clone());
     }
     by_coin
@@ -1013,10 +1038,11 @@ impl OrderBookListener {
     /// snapshot landed before the backfill drained, or the cache overflowed),
     /// the batch cannot be used safely - mark the book for re-sync instead; the
     /// re-fetched snapshot's height supersedes everything the backfill carried.
-    fn cache_backfill_batch(&mut self, event_batch: EventBatch) {
+    fn cache_backfill_batch(&mut self, mut event_batch: EventBatch) {
         if matches!(event_batch, EventBatch::Fills(_)) {
             return;
         }
+        strip_untracked_events(&mut event_batch, &self.markets);
         if self.fetched_snapshot_cache.is_some() {
             self.push_to_replay_cache(event_batch);
         } else {
@@ -1028,7 +1054,7 @@ impl OrderBookListener {
     /// HFT mode: events are applied the instant they arrive, without block-level
     /// synchronization, with order-level caching for status/diff pairing.
     /// Runs under the listener lock; everything here must stay cheap.
-    fn apply_event_batch(&mut self, height: u64, event_batch: EventBatch, event_source: EventSource) {
+    fn apply_event_batch(&mut self, height: u64, mut event_batch: EventBatch, event_source: EventSource) {
         /// Largest batch we'll process. Each event is a few hundred bytes; a 100k-event
         /// batch would already block the listener for seconds and pin hundreds of MB.
         /// In normal operation a single block's batch is tens to low thousands of events.
@@ -1038,6 +1064,10 @@ impl OrderBookListener {
         // Track the highest live-stream height: it bounds the height of any
         // data loss whose exact position is unknown (see mark_desynced).
         self.last_seen_height = self.last_seen_height.max(height);
+
+        // Untracked markets leave here, before the size cap, the replay cache,
+        // the broadcast grouping and the book.
+        strip_untracked_events(&mut event_batch, &self.markets);
 
         // Sanity cap on batch size. A malformed/malicious line could otherwise
         // pin hundreds of MB and freeze the listener for seconds.
@@ -1087,7 +1117,7 @@ impl OrderBookListener {
                             let msg = Arc::new(InternalMessage::L4OrderStatuses {
                                 time: batch.block_time(),
                                 height: batch.block_number(),
-                                statuses_by_coin: group_statuses_by_coin(batch.events_ref()),
+                                statuses_by_coin: group_statuses_by_coin(batch.events_ref(), state.markets()),
                             });
                             drop(tx.send(msg));
                         }
@@ -1098,13 +1128,13 @@ impl OrderBookListener {
                 EventBatch::BookDiffs(batch) => {
                     // Broadcast L4 order diffs for L4Book / BookDiffs subscribers,
                     // grouped per coin once and Arc-shared across connections.
-                    // Defense-in-depth: when running with `ignore_spot=true`, the
-                    // grouping also strips spot diffs - otherwise `bookDiffs`
+                    // Defense-in-depth: the grouping also strips diffs for markets
+                    // this instance does not track - otherwise `bookDiffs`
                     // clients would see events for coins whose state we never
                     // applied locally.
                     if let Some(tx) = &self.internal_message_tx {
                         if self.active_subs.wants(BroadcastKind::L4Diffs) {
-                            let diffs_by_coin = group_diffs_by_coin(batch.events_ref(), state.ignore_spot());
+                            let diffs_by_coin = group_diffs_by_coin(batch.events_ref(), state.markets());
                             if !diffs_by_coin.is_empty() {
                                 let msg = Arc::new(InternalMessage::L4OrderDiffs {
                                     time: batch.block_time(),
@@ -1582,14 +1612,17 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
         docker_container: config.docker_container.clone(),
         hlnode_binary: config.hlnode_binary.clone(),
         abci_state_path: config.abci_state_path.clone(),
-        snapshot_output_path: config.snapshot_output_path.clone(),
+        snapshot_output_path: config
+            .snapshot_output_path
+            .clone()
+            .or_else(|| default_direct_snapshot_path(config.snapshot_mode, &config.address)),
         visor_state_path: config.visor_state_path.clone(),
         data_dir: dir.clone(),
     };
 
     let ignore_spot = {
         let listener = listener.lock().await;
-        listener.ignore_spot
+        !listener.markets.includes_spot()
     };
 
     // Startup-backfill floor: the node's currently persisted height. The initial
@@ -1736,7 +1769,18 @@ pub(crate) async fn hl_listen_hft(listener: Arc<Mutex<OrderBookListener>>, confi
                             return Err(format!("Abci state reading error: {err}").into());
                         }
                     }
-                    Some(Ok(())) => {}
+                    Some(Ok(())) => {
+                        // A filter that matches nothing (a mistyped dex, say) would
+                        // otherwise look like a healthy instance with no markets.
+                        let guard = listener.lock().await;
+                        if guard.is_ready() && !guard.markets.tracks_everything() && guard.universe().is_empty() {
+                            return Err(format!(
+                                "no market in the node snapshot matches --markets {}; check the market and dex names",
+                                guard.markets
+                            )
+                            .into());
+                        }
+                    }
                 }
                 // Backoff bookkeeping: converged installs reset the spacing,
                 // anything else (fetch error, or an install that re-marked
@@ -1804,7 +1848,7 @@ mod tests {
     /// broadcast receiver so `receiver_count() > 0`.
     fn ready_listener() -> (OrderBookListener, tokio::sync::broadcast::Receiver<Arc<InternalMessage>>) {
         let (tx, rx) = tokio::sync::broadcast::channel(32);
-        let mut listener = OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), (true, true, true));
+        let mut listener = OrderBookListener::new(Some(tx), MarketFilter::new(true, false, true, Vec::new()), ActiveL2Params::new());
         listener.init_from_snapshot(Snapshots::new(HashMap::new()), 0);
         (listener, rx)
     }
@@ -2123,7 +2167,7 @@ mod tests {
     #[test]
     fn test_startup_events_cached_and_replayed_above_snapshot_height() {
         let (tx, _rx) = tokio::sync::broadcast::channel(32);
-        let mut listener = OrderBookListener::new(Some(tx), false, ActiveL2Params::new(), (true, true, true));
+        let mut listener = OrderBookListener::new(Some(tx), MarketFilter::all(), ActiveL2Params::new());
         assert!(!listener.is_ready());
 
         // Events stream in while the snapshot is being generated (book not ready).
@@ -2164,7 +2208,7 @@ mod tests {
     #[test]
     fn test_cache_overflow_keeps_book_desynced_until_clean_resync() {
         let (tx, _rx) = tokio::sync::broadcast::channel(32);
-        let mut listener = OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), (true, true, true));
+        let mut listener = OrderBookListener::new(Some(tx), MarketFilter::new(true, false, true, Vec::new()), ActiveL2Params::new());
         listener.set_cache_event_cap(1);
 
         feed_order(&mut listener, "AAA", 1, 10); // 2 single-event batches: second one overflows
@@ -2262,7 +2306,7 @@ mod tests {
     async fn test_phased_install_startup_replays_cache_above_snapshot_height() {
         let (tx, _rx) = tokio::sync::broadcast::channel(32);
         let listener =
-            Arc::new(Mutex::new(OrderBookListener::new(Some(tx), false, ActiveL2Params::new(), (true, true, true))));
+            Arc::new(Mutex::new(OrderBookListener::new(Some(tx), MarketFilter::all(), ActiveL2Params::new())));
         {
             let mut guard = listener.lock().await;
             assert!(!guard.is_ready());
@@ -2329,7 +2373,7 @@ mod tests {
         // on its first lock hold (pure finish_install path).
         let (tx, _rx) = tokio::sync::broadcast::channel(32);
         let listener =
-            Arc::new(Mutex::new(OrderBookListener::new(Some(tx), false, ActiveL2Params::new(), (true, true, true))));
+            Arc::new(Mutex::new(OrderBookListener::new(Some(tx), MarketFilter::all(), ActiveL2Params::new())));
         listener.lock().await.begin_caching();
         feed_order(&mut *listener.lock().await, "NEW", 1, 200);
 
@@ -2348,7 +2392,7 @@ mod tests {
         // was incomplete, so the loss bookkeeping must keep a re-sync scheduled.
         let (tx, _rx) = tokio::sync::broadcast::channel(32);
         let listener =
-            Arc::new(Mutex::new(OrderBookListener::new(Some(tx), true, ActiveL2Params::new(), (true, true, true))));
+            Arc::new(Mutex::new(OrderBookListener::new(Some(tx), MarketFilter::new(true, false, true, Vec::new()), ActiveL2Params::new())));
         {
             let mut guard = listener.lock().await;
             guard.set_cache_event_cap(1);
@@ -2382,7 +2426,7 @@ mod tests {
         // discards the cache, and keeps a re-sync scheduled.
         let (tx, _rx) = tokio::sync::broadcast::channel(32);
         let listener =
-            Arc::new(Mutex::new(OrderBookListener::new(Some(tx), false, ActiveL2Params::new(), (true, true, true))));
+            Arc::new(Mutex::new(OrderBookListener::new(Some(tx), MarketFilter::all(), ActiveL2Params::new())));
         {
             let mut guard = listener.lock().await;
             guard.begin_caching();
@@ -2819,5 +2863,86 @@ mod tests {
         assert!(reg.snapshot().contains(&p), "shape still referenced by g1");
         drop(g1);
         assert!(reg.snapshot().is_empty());
+    }
+
+    // ==================== Market Filtering ====================
+
+    fn perps_only_listener() -> (OrderBookListener, tokio::sync::broadcast::Receiver<Arc<InternalMessage>>) {
+        let (tx, rx) = tokio::sync::broadcast::channel(32);
+        let markets = MarketFilter::new(true, false, false, Vec::new());
+        let mut listener = OrderBookListener::new(Some(tx), markets, ActiveL2Params::new());
+        listener.init_from_snapshot(Snapshots::new(HashMap::new()), 0);
+        (listener, rx)
+    }
+
+    #[test]
+    fn test_strip_keeps_the_batch_and_drops_only_untracked_events() {
+        let perps = MarketFilter::new(true, false, false, Vec::new());
+
+        let mut diffs = EventBatch::BookDiffs(make_multi_diff_batch(&["BTC", "xyz:AMD", "@107", "ETH"], 42));
+        strip_untracked_events(&mut diffs, &perps);
+        let EventBatch::BookDiffs(batch) = diffs else { panic!("variant changed") };
+        assert_eq!(batch.block_number(), 42, "height must survive so the book still advances");
+        let coins: Vec<&str> = batch.events_ref().iter().map(NodeDataOrderDiff::coin_str).collect();
+        assert_eq!(coins, vec!["BTC", "ETH"]);
+
+        // Both legs of a fill share a coin, so a pair is kept or dropped whole.
+        let mut fills = EventBatch::Fills(make_fills_batch(&["xyz:AMD", "BTC"], 43));
+        strip_untracked_events(&mut fills, &perps);
+        let EventBatch::Fills(batch) = fills else { panic!("variant changed") };
+        assert_eq!(batch.events_len(), 2);
+        assert!(batch.events_ref().iter().all(|fill| fill.1.coin == "BTC"));
+
+        // A batch with nothing tracked stays, empty.
+        let mut statuses = EventBatch::Orders(make_status_batch("xyz:AMD", 1, 44));
+        strip_untracked_events(&mut statuses, &perps);
+        let EventBatch::Orders(batch) = statuses else { panic!("variant changed") };
+        assert_eq!((batch.block_number(), batch.events_len()), (44, 0));
+
+        // No filter: nothing is touched.
+        let mut all = EventBatch::BookDiffs(make_multi_diff_batch(&["BTC", "xyz:AMD", "@107"], 45));
+        strip_untracked_events(&mut all, &MarketFilter::all());
+        let EventBatch::BookDiffs(batch) = all else { panic!("variant changed") };
+        assert_eq!(batch.events_len(), 3);
+    }
+
+    #[test]
+    fn test_untracked_market_never_reaches_the_book_or_the_universe() {
+        let (mut listener, _rx) = perps_only_listener();
+        feed_order(&mut listener, "xyz:AMD", 1, 10);
+        feed_order(&mut listener, "@107", 2, 11);
+        feed_order(&mut listener, "BTC", 3, 12);
+        let universe = listener.universe();
+        assert!(universe.contains("BTC"));
+        assert!(!universe.contains("xyz:AMD"));
+        assert!(!universe.contains("@107"));
+        assert_eq!(universe.len(), 1);
+    }
+
+    #[test]
+    fn test_untracked_events_are_not_kept_for_replay() {
+        let (mut listener, _rx) = perps_only_listener();
+        listener.begin_caching();
+        let before = listener.cached_event_count;
+
+        // Live path and backfill path: neither may spend replay cache on another market.
+        listener.apply_event_batch(20, EventBatch::Orders(make_status_batch("xyz:AMD", 5, 20)), EventSource::OrderStatuses);
+        listener.cache_backfill_batch(EventBatch::Orders(make_status_batch("xyz:AMD", 6, 21)));
+        assert_eq!(listener.cached_event_count, before);
+
+        listener.apply_event_batch(22, EventBatch::Orders(make_status_batch("BTC", 7, 22)), EventSource::OrderStatuses);
+        assert_eq!(listener.cached_event_count, before + 1);
+    }
+
+    #[test]
+    fn test_direct_mode_snapshot_file_is_named_after_the_port() {
+        use crate::SnapshotMode;
+        assert_eq!(
+            default_direct_snapshot_path(SnapshotMode::Direct, "0.0.0.0:8001"),
+            Some(std::path::PathBuf::from("/tmp/hl_snapshot_8001.json"))
+        );
+        // Docker mode writes a fixed file inside the container; nothing to derive.
+        assert_eq!(default_direct_snapshot_path(SnapshotMode::Docker, "0.0.0.0:8001"), None);
+        assert_eq!(default_direct_snapshot_path(SnapshotMode::Direct, "not-an-address"), None);
     }
 }

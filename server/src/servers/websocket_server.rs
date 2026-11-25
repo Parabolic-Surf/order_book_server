@@ -115,9 +115,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     // connection as needed, would decouple loss domains and wakeup cost.
     let (internal_message_tx, _) = channel::<Arc<InternalMessage>>(16384);
 
-    // Market filter flags from config
-    let market_filter = (config.include_perps, config.include_spot, config.include_hip3);
-    let ignore_spot = !config.include_spot; // For OrderBookListener (legacy)
+    let markets = config.markets.clone();
     let compression_level = config.compression_level;
 
     // Shared registry of L2 variant shapes any live connection wants. Cloned into
@@ -130,7 +128,7 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
     let listener = {
         let internal_message_tx = internal_message_tx.clone();
         let mut listener =
-            OrderBookListener::new(Some(internal_message_tx), ignore_spot, active_l2_params.clone(), market_filter);
+            OrderBookListener::new(Some(internal_message_tx), markets, active_l2_params.clone());
         listener.set_tolerate_drift(config.no_resync);
         // BBO-only deployments are sized for a lightweight envelope and have no
         // consumers for /untriggeredOrders - skip maintaining the side table.
@@ -274,12 +272,24 @@ pub async fn run_websocket_server(config: ServerConfig) -> Result<()> {
 /// subscriber count for zero bandwidth win. `Options::default()` leaves
 /// compression None, declining the extension entirely.
 fn websocket_options(compression_level: u32) -> yawc::Options {
+    let options = yawc::Options::default().with_max_payload_read(MAX_CLIENT_FRAME_BYTES);
     if compression_level > 0 {
-        yawc::Options::default().with_compression_level(yawc::CompressionLevel::new(compression_level))
+        options.with_compression_level(yawc::CompressionLevel::new(compression_level))
     } else {
-        yawc::Options::default()
+        options
     }
 }
+
+/// Largest client frame read off the wire. Client messages are short JSON
+/// requests (a subscribe is about 150 bytes); the library default of 1 MiB lets
+/// one compressed frame inflate to about a gigabyte. The limit applies to the
+/// compressed size, and deflate reaches about 1000:1, so a frame within it can
+/// still inflate to a few megabytes before the check below sees it.
+const MAX_CLIENT_FRAME_BYTES: usize = 4 * 1024;
+
+/// Largest client message handled after decompression. Anything larger closes
+/// the connection before the payload is parsed, logged or answered.
+const MAX_CLIENT_MESSAGE_BYTES: usize = 64 * 1024;
 
 /// `TcpListener` wrapper that sets `TCP_NODELAY` on every accepted socket.
 /// Without it, Nagle's algorithm can delay small frames (BBO updates are a few
@@ -642,12 +652,21 @@ async fn run_session(
 
             msg = ws_read.next() => {
                 if let Some(frame) = msg {
+                    // Any frame type: an oversized binary frame is as costly as a text one.
+                    if frame.payload.len() > MAX_CLIENT_MESSAGE_BYTES {
+                        log::warn!(
+                            "closing connection: client frame of {} bytes exceeds the {MAX_CLIENT_MESSAGE_BYTES} byte limit",
+                            frame.payload.len()
+                        );
+                        return;
+                    }
                     match frame.opcode {
                         OpCode::Text => {
                             let text = match std::str::from_utf8(&frame.payload) {
                                 Ok(text) => text,
                                 Err(err) => {
-                                    log::warn!("unable to parse websocket content: {err}: {:?}", frame.payload.as_ref());
+                                    // Length only: the bytes are client-controlled.
+                                    log::warn!("unable to parse websocket content ({} bytes): {err}", frame.payload.len());
                                     // deserves to close the connection because the payload is not a valid utf8 string.
                                     return;
                                 }
@@ -668,7 +687,8 @@ async fn run_session(
                                 }
                             }
                             else {
-                                let msg = ServerResponse::Error(format!("Error parsing JSON into valid websocket request: {text}"));
+                                // The request is not echoed back: it is client-controlled and can be large.
+                                let msg = ServerResponse::Error("Error parsing JSON into valid websocket request".to_string());
                                 alive &= outbound.send_message(msg).await;
                             }
                         }
@@ -1500,6 +1520,16 @@ mod tests {
         pin::Pin,
         task::{Context, Poll},
     };
+
+    #[test]
+    fn client_frames_are_capped_with_and_without_compression() {
+        for level in [0, 1, 9] {
+            let options = websocket_options(level);
+            assert_eq!(options.max_payload_read, Some(MAX_CLIENT_FRAME_BYTES), "level {level}");
+        }
+        assert!(websocket_options(0).compression.is_none());
+        assert!(websocket_options(1).compression.is_some());
+    }
 
     /// Sink that records every sent frame's payload, for driving `write_task`.
     #[derive(Clone, Default)]

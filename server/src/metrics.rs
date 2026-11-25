@@ -71,6 +71,12 @@ lazy_static! {
         &["type"]
     ).expect("metric can be created");
 
+    /// Events skipped by the market filter, by type (orders, diffs)
+    pub static ref EVENTS_FILTERED_TOTAL: IntCounterVec = IntCounterVec::new(
+        Opts::new("events_filtered_total", "Events skipped because their market is not tracked"),
+        &["type"]
+    ).expect("metric can be created");
+
     /// Broadcasts sent by channel type
     pub static ref BROADCASTS_TOTAL: IntCounterVec = IntCounterVec::new(
         Opts::new("broadcasts_total", "Total broadcasts sent"),
@@ -294,6 +300,7 @@ pub fn register_metrics() {
 
     // Throughput metrics
     REGISTRY.register(Box::new(EVENTS_PROCESSED_TOTAL.clone())).ok();
+    REGISTRY.register(Box::new(EVENTS_FILTERED_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(BROADCASTS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(TRADES_UNPAIRED_FILLS_TOTAL.clone())).ok();
     REGISTRY.register(Box::new(MESSAGES_SENT_TOTAL.clone())).ok();

@@ -14,11 +14,29 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::process::Command;
 
 use crate::SnapshotMode;
+
+/// Longest a direct-mode snapshot dump may run. A dump normally takes well under
+/// a minute; one that hangs would block every later re-sync while the replay
+/// cache grows.
+const SNAPSHOT_COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Run a snapshot command to completion, killing it if it outlives `limit`.
+/// Only for a command that is itself the dump: the kill reaches the direct child.
+async fn run_snapshot_command(command: &mut Command, limit: Duration) -> std::io::Result<std::process::Output> {
+    // Dropping the output future on timeout drops the child, which kills it.
+    command.kill_on_drop(true);
+    tokio::time::timeout(limit, command.output()).await.unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("snapshot command still running after {} s; killed", limit.as_secs()),
+        ))
+    })
+}
 
 /// Configuration for snapshot fetching
 #[derive(Debug, Clone)]
@@ -47,6 +65,8 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
             let parent_dir = config.data_dir.parent().unwrap_or(&config.data_dir);
             let output_path = config.snapshot_output_path.clone().unwrap_or_else(|| parent_dir.join("snapshot.json"));
 
+            // No timeout here: killing `docker exec` would leave the dump running
+            // inside the container, where it could later overwrite a newer one.
             let output = Command::new("docker")
                 .args(&[
                     "exec",
@@ -95,18 +115,17 @@ pub(super) async fn process_rmp_file(config: &SnapshotConfig) -> Result<PathBuf>
                 output_path.display()
             );
 
-            let output = Command::new(&config.hlnode_binary)
-                .args(&[
-                    "--chain",
-                    "Mainnet",
-                    "compute-l4-snapshots",
-                    "--include-users",
-                    "--include-trigger-orders",
-                    abci_path.to_str().unwrap_or(""),
-                    output_path.to_str().unwrap_or(""),
-                ])
-                .output()
-                .await;
+            let mut command = Command::new(&config.hlnode_binary);
+            command.args(&[
+                "--chain",
+                "Mainnet",
+                "compute-l4-snapshots",
+                "--include-users",
+                "--include-trigger-orders",
+                abci_path.to_str().unwrap_or(""),
+                output_path.to_str().unwrap_or(""),
+            ]);
+            let output = run_snapshot_command(&mut command, SNAPSHOT_COMMAND_TIMEOUT).await;
 
             match output {
                 Ok(out) => {
@@ -327,6 +346,41 @@ mod tests {
     };
     use alloy::primitives::Address;
     use std::collections::HashSet;
+
+    #[tokio::test]
+    async fn snapshot_command_that_finishes_returns_its_output() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "echo done"]);
+        let output = run_snapshot_command(&mut command, Duration::from_secs(10)).await.unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "done");
+    }
+
+    #[tokio::test]
+    async fn snapshot_command_that_hangs_times_out_and_is_killed() {
+        let pid_file = std::env::temp_dir().join(format!("snapshot-timeout-{}.pid", std::process::id()));
+        drop(std::fs::remove_file(&pid_file));
+        let mut command = Command::new("sh");
+        // Records its own pid, then becomes a long sleep: the same process the kill must reach.
+        command.args(["-c", &format!("echo $$ > {}; exec sleep 300", pid_file.display())]);
+        let started = Instant::now();
+        let error = run_snapshot_command(&mut command, Duration::from_secs(1)).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(60), "must not wait for the command");
+
+        // If the pid was never written the child died before it got that far, which is fine.
+        let Ok(pid) = std::fs::read_to_string(&pid_file) else { return };
+        drop(std::fs::remove_file(&pid_file));
+        let pid = pid.trim().to_string();
+        for _ in 0..100 {
+            let alive = std::process::Command::new("kill").args(["-0", &pid]).status().is_ok_and(|s| s.success());
+            if !alive {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("snapshot command {pid} was left running after the timeout");
+    }
 
     fn order(oid: u64, coin: &str, side: Side, sz: &str, px: &str) -> InnerL4Order {
         InnerL4Order {

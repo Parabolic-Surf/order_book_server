@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use clap::ValueEnum;
 
+pub use order_book::market_filter::MarketFilter;
 pub use prelude::Result;
 pub use servers::websocket_server::run_websocket_server;
 
@@ -32,12 +33,8 @@ pub struct ServerConfig {
     pub compression_level: u32,
     /// Optional base directory for hlnode data
     pub data_dir: Option<PathBuf>,
-    /// Include perpetual futures markets
-    pub include_perps: bool,
-    /// Include spot markets (@ coins, PURR/USDC)
-    pub include_spot: bool,
-    /// Include HIP-3 markets
-    pub include_hip3: bool,
+    /// Markets this instance tracks; events for every other market are skipped
+    pub markets: MarketFilter,
     /// Snapshot fetching mode (docker or direct)
     pub snapshot_mode: SnapshotMode,
     /// Docker container name for exec commands (docker mode only)

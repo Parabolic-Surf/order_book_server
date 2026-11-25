@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
-use server::{Result, ServerConfig, SnapshotMode, run_websocket_server};
+use server::{MarketFilter, Result, ServerConfig, SnapshotMode, run_websocket_server};
 
 // The fan-out path allocates heavily (per-level price/size strings, per-coin
 // payload groupings, one JSON buffer per send); mimalloc handles that
@@ -11,7 +11,7 @@ use server::{Result, ServerConfig, SnapshotMode, run_websocket_server};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Markets to include in the orderbook
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum Markets {
     /// Perpetual futures only
     Perps,
@@ -48,9 +48,16 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Which markets to include: perps, spot, hip3, all
-    #[arg(long, value_enum, default_value = "all")]
-    markets: Markets,
+    /// Markets to track, comma separated: perps, spot, hip3, all.
+    /// Events for every other market are skipped, so two instances can read
+    /// one node and split its load (for example `perps` and `hip3`).
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "all")]
+    markets: Vec<Markets>,
+
+    /// HIP-3 dexes to track, comma separated (for example `xyz`).
+    /// Empty tracks every dex. Needs hip3 in --markets.
+    #[arg(long, value_delimiter = ',')]
+    hip3_dexes: Vec<String>,
 
     // ========== Snapshot Configuration ==========
     /// Snapshot fetching mode: docker or direct
@@ -126,6 +133,24 @@ struct Args {
     replay_cache_events: usize,
 }
 
+/// Build the market filter from `--markets` and `--hip3-dexes`.
+fn market_filter(markets: &[Markets], hip3_dexes: &[String]) -> std::result::Result<MarketFilter, String> {
+    let all = markets.contains(&Markets::All);
+    let perps = all || markets.contains(&Markets::Perps);
+    let spot = all || markets.contains(&Markets::Spot);
+    let hip3 = all || markets.contains(&Markets::Hip3);
+    if !hip3_dexes.is_empty() && !hip3 {
+        return Err("--hip3-dexes needs hip3 in --markets".to_string());
+    }
+    for dex in hip3_dexes {
+        // A dex name is the part of a coin before ':' (for example `xyz` in `xyz:AMD`).
+        if dex.is_empty() || !dex.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return Err(format!("invalid HIP-3 dex name {dex:?}"));
+        }
+    }
+    Ok(MarketFilter::new(perps, spot, hip3, hip3_dexes.to_vec()))
+}
+
 /// Start the Prometheus metrics HTTP server
 async fn start_metrics_server(port: u16) {
     use axum::{Router, response::IntoResponse, routing::get};
@@ -160,12 +185,12 @@ async fn main() -> Result<()> {
 
     let full_address = format!("{}:{}", args.address, args.port);
 
-    // Determine market flags from Markets enum
-    let (include_perps, include_spot, include_hip3) = match args.markets {
-        Markets::Perps => (true, false, false),
-        Markets::Spot => (false, true, false),
-        Markets::Hip3 => (false, false, true),
-        Markets::All => (true, true, true),
+    let markets = match market_filter(&args.markets, &args.hip3_dexes) {
+        Ok(markets) => markets,
+        Err(message) => {
+            eprintln!("error: {message}");
+            std::process::exit(2);
+        }
     };
 
     // Build config
@@ -173,9 +198,7 @@ async fn main() -> Result<()> {
         address: full_address.clone(),
         compression_level: args.compression_level,
         data_dir: args.data_dir,
-        include_perps,
-        include_spot,
-        include_hip3,
+        markets,
         snapshot_mode: args.snapshot_mode,
         docker_container: args.docker_container,
         hlnode_binary: args.hlnode_binary,
@@ -192,7 +215,7 @@ async fn main() -> Result<()> {
 
     println!("Orderbook Server v{}", env!("CARGO_PKG_VERSION"));
     println!("  Address: {}", config.address);
-    println!("  Markets: {:?}", args.markets);
+    println!("  Markets: {}", config.markets);
     if config.bbo_only {
         println!("  Mode: BBO-ONLY (lightweight, ~100MB RAM)");
         println!("  Note: L2/L4/Trades subscriptions disabled");
@@ -253,4 +276,62 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    fn parse(options: &[&str]) -> std::result::Result<MarketFilter, String> {
+        let mut command_line = vec!["orderbook_server"];
+        command_line.extend_from_slice(options);
+        let parsed = Args::try_parse_from(command_line).map_err(|error| error.to_string())?;
+        market_filter(&parsed.markets, &parsed.hip3_dexes)
+    }
+
+    #[test]
+    fn default_tracks_every_market() {
+        assert_eq!(parse(&[]).unwrap(), MarketFilter::all());
+        assert_eq!(parse(&["--markets", "all"]).unwrap(), MarketFilter::all());
+    }
+
+    #[test]
+    fn single_values_still_parse() {
+        assert_eq!(parse(&["--markets", "perps"]).unwrap().to_string(), "perps");
+        assert_eq!(parse(&["--markets", "spot"]).unwrap().to_string(), "spot");
+        assert_eq!(parse(&["--markets", "hip3"]).unwrap().to_string(), "hip3");
+    }
+
+    #[test]
+    fn a_list_combines_markets() {
+        let filter = parse(&["--markets", "perps,hip3"]).unwrap();
+        assert!(filter.includes("BTC"));
+        assert!(filter.includes("xyz:AMD"));
+        assert!(!filter.includes("@107"));
+    }
+
+    #[test]
+    fn dexes_narrow_hip3() {
+        let filter = parse(&["--markets", "hip3", "--hip3-dexes", "xyz"]).unwrap();
+        assert!(filter.includes("xyz:AMD"));
+        assert!(!filter.includes("io:GOLD"));
+        assert!(!filter.includes("BTC"));
+    }
+
+    #[test]
+    fn dexes_without_hip3_are_rejected() {
+        assert!(parse(&["--markets", "perps", "--hip3-dexes", "xyz"]).unwrap_err().contains("needs hip3"));
+    }
+
+    #[test]
+    fn malformed_dex_names_are_rejected() {
+        assert!(parse(&["--markets", "hip3", "--hip3-dexes", "xyz:AMD"]).unwrap_err().contains("invalid"));
+        assert!(parse(&["--markets", "hip3", "--hip3-dexes", "xyz,,io"]).unwrap_err().contains("invalid"));
+    }
+
+    #[test]
+    fn unknown_markets_are_rejected() {
+        assert!(parse(&["--markets", "futures"]).is_err());
+    }
 }

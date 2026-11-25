@@ -85,7 +85,8 @@ cp /path/to/hl-node /usr/local/bin/ob-snapshotter
 | `--address` | `0.0.0.0` | Bind address |
 | `--port` | `8000` | WebSocket port |
 | `--compression-level` | `1` | WebSocket compression level (0-9). See [Compression](#compression) |
-| `--markets` | `all` | `perps`, `spot`, `hip3`, `all` |
+| `--markets` | `all` | Comma-separated list of `perps`, `spot`, `hip3`, `all`. See [Market Types](#market-types) |
+| `--hip3-dexes` | empty | Comma-separated HIP-3 dex names to track (e.g. `xyz`). Empty tracks every dex |
 | `--log-level` | `info` | `error`, `warn`, `info`, `debug`, `trace` |
 
 ### Compression
@@ -146,6 +147,36 @@ The handoff from snapshot to live stream is **gapless**: at startup the server b
 | `spot` | Spot markets (`@*` coins, PURR/USDC) |
 | `hip3` | HIP-3 markets (X:Y format, e.g., xyz:TSLA) |
 | `all` | All markets (default) |
+
+`--markets` takes a list, so `--markets perps,hip3` tracks everything except spot. `--hip3-dexes xyz` narrows HIP-3 to the named dexes.
+
+The filter is applied where events enter: an order status, book diff, fill or snapshot book for a market that is not tracked is dropped before it is cached, broadcast or applied, and counted in `events_filtered_total`. A skipped market costs almost nothing, which makes it possible to split one node's load across processes.
+
+What a filtered instance serves:
+
+- Every channel and endpoint covers tracked markets only. That includes `orderUpdates`, which is keyed by user: it no longer carries that user's orders in untracked markets.
+- A request for an untracked coin behaves like a request for an unknown coin.
+- An instance whose filter matches no market in the node snapshot (a mistyped dex name, for example) exits at startup instead of running empty.
+
+#### Splitting the load across instances
+
+All book updates are applied by one task, so a single instance is limited by one core. Two instances reading the same node each apply only their own markets:
+
+```bash
+# Perps on port 8000
+orderbook_server --snapshot-mode direct --hlnode-binary /path/to/snapshotter \
+    --port 8000 --metrics-port 9090 --markets perps ...
+
+# One HIP-3 dex on port 8001
+orderbook_server --snapshot-mode direct --hlnode-binary /path/to/snapshotter \
+    --port 8001 --metrics-port 9091 --markets hip3 --hip3-dexes xyz ...
+```
+
+Rules for running more than one instance on a host:
+
+- Use `--snapshot-mode direct`. In docker mode every instance has the node write the same file inside the container, so two instances can read each other's snapshot.
+- Give each instance its own `--port` and `--metrics-port`.
+- In direct mode the snapshot file defaults to `/tmp/hl_snapshot_<port>.json`, so instances do not share it. If you set `--snapshot-output-path`, set a different one per instance.
 
 ### Advanced Options
 

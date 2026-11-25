@@ -29,6 +29,11 @@ impl NodeDataOrderDiff {
     pub(crate) fn coin(&self) -> Coin {
         Coin::new(&self.coin)
     }
+
+    /// The coin name without allocating a `Coin`.
+    pub(crate) fn coin_str(&self) -> &str {
+        &self.coin
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +124,12 @@ impl<E> Batch<E> {
         self.events.len()
     }
 
+    /// Keep only the events `keep` accepts; returns how many were dropped.
+    pub(crate) fn retain_events(&mut self, keep: impl FnMut(&E) -> bool) -> usize {
+        let before = self.events.len();
+        self.events.retain(keep);
+        before - self.events.len()
+    }
 }
 
 #[cfg(test)]

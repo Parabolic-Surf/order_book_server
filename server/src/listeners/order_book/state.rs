@@ -2,6 +2,7 @@ use crate::{
     listeners::order_book::L2Snapshots,
     order_book::{
         Coin, InnerOrder, Oid, PxBand, Snapshot,
+        market_filter::MarketFilter,
         multi_book::{OrderBooks, Snapshots},
     },
     prelude::*,
@@ -19,7 +20,8 @@ pub(super) struct OrderBookState {
     order_book: OrderBooks<InnerL4Order>,
     height: u64,
     time: u64,
-    ignore_spot: bool,
+    // Events and snapshot books for markets outside this filter are skipped.
+    markets: MarketFilter,
     // Persistent cache of OrderStatuses waiting for their New diffs
     // Allows OrderStatus and OrderDiff to arrive in any order (HFT-compatible).
     // Entries carry their insertion time so cleanup can evict by age instead of
@@ -44,6 +46,9 @@ pub(super) struct OrderBookState {
     // Replaced wholesale on every re-sync along with the book, so a missed
     // terminal status self-heals at the next snapshot install.
     untriggered_orders: rustc_hash::FxHashMap<Coin, rustc_hash::FxHashMap<Oid, std::sync::Arc<InnerL4Order>>>,
+    // Whether the snapshot this state was built from carried any trigger order,
+    // in any market. An empty table after filtering is not a dump without triggers.
+    dump_had_untriggered: bool,
     // False in --bbo-only mode: the map stays empty there so the documented
     // lightweight memory envelope holds (the endpoint has no consumers in a
     // BBO-only deployment anyway).
@@ -57,9 +62,17 @@ impl OrderBookState {
         height: u64,
         time: u64,
         ignore_triggers: bool,
-        ignore_spot: bool,
+        markets: MarketFilter,
         track_untriggered: bool,
     ) -> Self {
+        // Legacy dumps append triggers to the book sides. Taken from every market
+        // before filtering, so whether the dump carried any trigger at all is
+        // known even when none belongs to a tracked market.
+        let embedded_triggers =
+            if ignore_triggers && track_untriggered { snapshot.extract_triggers() } else { Vec::new() };
+        let dump_had_untriggered = !untriggered.is_empty() || !embedded_triggers.is_empty();
+        // No book is built for a market this instance does not track.
+        snapshot.retain_coins(|coin| markets.includes_coin(coin));
         // Seed the side table from the dump's untriggered_orders section
         // (--include-trigger-orders) - the full standing stop book, one entry
         // per order. The legacy tail extraction below covers old-format dumps
@@ -70,16 +83,16 @@ impl OrderBookState {
         > = rustc_hash::FxHashMap::default();
         if track_untriggered {
             for order in untriggered {
-                if ignore_spot && order.coin.is_spot() {
+                if !markets.includes_coin(&order.coin) {
                     continue;
                 }
                 let oid = order.oid();
                 untriggered_orders.entry(order.coin.clone()).or_default().insert(oid, std::sync::Arc::new(order));
             }
         }
-        if ignore_triggers && track_untriggered {
-            for order in snapshot.extract_triggers() {
-                if ignore_spot && order.coin.is_spot() {
+        {
+            for order in embedded_triggers {
+                if !markets.includes_coin(&order.coin) {
                     continue;
                 }
                 let oid = order.oid();
@@ -96,7 +109,7 @@ impl OrderBookState {
             }
         }
         Self {
-            ignore_spot,
+            markets,
             time,
             height,
             order_book: OrderBooks::from_snapshots(snapshot, ignore_triggers),
@@ -104,6 +117,7 @@ impl OrderBookState {
             pending_new_diffs: rustc_hash::FxHashMap::default(),
             insert_before_fallbacks: 0,
             untriggered_orders,
+            dump_had_untriggered,
             track_untriggered,
         }
     }
@@ -131,8 +145,8 @@ impl OrderBookState {
         self.height
     }
 
-    pub(super) const fn ignore_spot(&self) -> bool {
-        self.ignore_spot
+    pub(super) const fn markets(&self) -> &MarketFilter {
+        &self.markets
     }
 
     pub(super) const fn time(&self) -> u64 {
@@ -203,7 +217,13 @@ impl OrderBookState {
     /// Call BEFORE replaying cached events so evictions recorded during the
     /// fetch window still apply to the carried entries. Cost: Arc bumps only.
     pub(super) fn carry_forward_untriggered(&mut self, prev: &Self) {
-        if self.track_untriggered && self.untriggered_orders.is_empty() && !prev.untriggered_orders.is_empty() {
+        // A dump that had triggers only in untracked markets is still authoritative:
+        // carrying the old table forward there would bring back stale stops.
+        if self.track_untriggered
+            && !self.dump_had_untriggered
+            && self.untriggered_orders.is_empty()
+            && !prev.untriggered_orders.is_empty()
+        {
             self.untriggered_orders = prev.untriggered_orders.clone();
             log::info!(
                 "Snapshot contained no untriggered trigger orders; carried {} forward from previous state",
@@ -334,7 +354,14 @@ impl OrderBookState {
             self.time = time;
         }
 
+        let mut filtered = 0_u64;
         for order_status in batch.events() {
+            // Skipped before any cache: a status kept here would wait forever
+            // for a diff that the diff path skips too.
+            if !self.markets.includes(&order_status.order.coin) {
+                filtered += 1;
+                continue;
+            }
             let oid = Oid::new(order_status.order.oid);
 
             // Maintain the untriggered-orders side table. "open" + is_trigger is a
@@ -346,7 +373,7 @@ impl OrderBookState {
             if !self.track_untriggered {
                 // gated off (--bbo-only): the map stays empty
             } else if order_status.status == "open" {
-                if order_status.order.is_trigger && !(self.ignore_spot && Coin::str_is_spot(&order_status.order.coin)) {
+                if order_status.order.is_trigger {
                     match InnerL4Order::try_from((order_status.user, order_status.order.clone())) {
                         Ok(inner) => {
                             self.untriggered_orders
@@ -399,6 +426,9 @@ impl OrderBookState {
                 self.pending_order_statuses.insert(oid, (order_status, Instant::now()));
             }
         }
+        if filtered > 0 {
+            crate::metrics::EVENTS_FILTERED_TOTAL.with_label_values(&["orders"]).inc_by(filtered);
+        }
         Ok(changed_coins)
     }
 
@@ -439,12 +469,14 @@ impl OrderBookState {
             self.time = time;
         }
 
+        let mut filtered = 0_u64;
         for diff in batch.events() {
-            let oid = diff.oid();
-            let coin = diff.coin();
-            if coin.is_spot() && self.ignore_spot {
+            if !self.markets.includes(diff.coin_str()) {
+                filtered += 1;
                 continue;
             }
+            let oid = diff.oid();
+            let coin = diff.coin();
             let inner_diff = diff.diff().try_into()?;
             match inner_diff {
                 InnerOrderDiff::New { sz, insert_before } => {
@@ -481,6 +513,9 @@ impl OrderBookState {
                 }
             }
         }
+        if filtered > 0 {
+            crate::metrics::EVENTS_FILTERED_TOTAL.with_label_values(&["diffs"]).inc_by(filtered);
+        }
         Ok(changed_coins)
     }
 }
@@ -496,7 +531,16 @@ mod tests {
 
     fn empty_state() -> OrderBookState {
         let snapshots = Snapshots::new(HashMap::new());
-        OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, false, true)
+        OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, MarketFilter::all(), true)
+    }
+
+    /// Every market except spot: what the old `ignore_spot` flag selected.
+    fn without_spot() -> MarketFilter {
+        MarketFilter::new(true, false, true, Vec::new())
+    }
+
+    fn state_tracking(markets: MarketFilter) -> OrderBookState {
+        OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), Vec::new(), 0, 0, true, markets, true)
     }
 
     fn make_l4_order(coin: &str, oid: u64) -> L4Order {
@@ -627,7 +671,7 @@ mod tests {
     #[test]
     fn test_from_snapshot_extracts_untriggered_triggers() {
         let snapshots = snapshot_with_triggers("BTC", &[1, 2], &[100, 101]);
-        let state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, false, true);
+        let state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, MarketFilter::all(), true);
         // Triggers are kept in the side table (deduped from the two per-side
         // copies), not dropped - and never enter the book.
         assert_eq!(state.untriggered_count(), 2);
@@ -643,7 +687,7 @@ mod tests {
     fn test_from_snapshot_ignore_triggers_false_keeps_old_semantics() {
         // Tests that opt out of trigger extraction must not populate the table.
         let snapshots = snapshot_with_triggers("BTC", &[1], &[]);
-        let state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, false, false, true);
+        let state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, false, MarketFilter::all(), true);
         assert_eq!(state.untriggered_count(), 0);
     }
 
@@ -711,8 +755,7 @@ mod tests {
     fn test_spot_triggers_skipped_when_ignore_spot() {
         // Live path: spot trigger opens are not tracked under ignore_spot,
         // matching the diff path's spot filtering.
-        let mut state =
-            OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), Vec::new(), 0, 0, true, true, true);
+        let mut state = state_tracking(without_spot());
         state
             .apply_order_statuses_hft(make_status_batch(vec![
                 make_trigger_status("@1", 1, "open", "1.0"),
@@ -731,7 +774,7 @@ mod tests {
             0,
             0,
             true,
-            true,
+            without_spot(),
             true,
         );
         assert_eq!(spot_state.untriggered_count(), 0);
@@ -742,7 +785,8 @@ mod tests {
         // The --include-trigger-orders dump path: untriggered orders arrive as a
         // flat list, not embedded in the book sides.
         let seed = vec![make_inner_order("BTC", 100, true), make_inner_order("ETH", 101, true)];
-        let state = OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), seed, 0, 0, true, false, true);
+        let state =
+            OrderBookState::from_snapshot(Snapshots::new(HashMap::new()), seed, 0, 0, true, MarketFilter::all(), true);
         assert_eq!(state.untriggered_count(), 2);
         assert_eq!(state.order_count(), 0);
         let (_, _, btc) = state.untriggered_snapshot(Some(&Coin::new("BTC")));
@@ -761,7 +805,7 @@ mod tests {
             0,
             0,
             true,
-            false,
+            MarketFilter::all(),
             false,
         );
         assert_eq!(state.untriggered_count(), 0);
@@ -964,13 +1008,145 @@ mod tests {
 
     #[test]
     fn test_spot_filtered_when_ignore_spot() {
-        let snapshots = Snapshots::new(HashMap::new());
-        let mut state = OrderBookState::from_snapshot(snapshots, Vec::new(), 0, 0, true, true, true); // ignore_spot=true
+        let mut state = state_tracking(without_spot());
 
         let diff = make_order_diff("@1", 1, OrderDiff::New { sz: "1.0".to_string(), insert_before: None });
         let changed = state.apply_order_diffs_hft(make_diff_batch(vec![diff])).unwrap();
         assert!(changed.is_empty());
         assert_eq!(state.pending_new_diffs_count(), 0); // skipped entirely
+    }
+
+    // ==================== Market Filtering ====================
+
+    fn new_diff(coin: &str, oid: u64) -> NodeDataOrderDiff {
+        make_order_diff(coin, oid, OrderDiff::New { sz: "1.0".to_string(), insert_before: None })
+    }
+
+    #[test]
+    fn test_perps_only_skips_hip3_and_spot_in_both_paths() {
+        let mut state = state_tracking(MarketFilter::new(true, false, false, Vec::new()));
+
+        // Statuses first: nothing for a skipped market may wait in the cache,
+        // because its diff is skipped too and would never arrive to pair it.
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![
+                make_order_status("xyz:AMD", 1, "open"),
+                make_order_status("@107", 2, "open"),
+                make_order_status("BTC", 3, "open"),
+            ]))
+            .unwrap();
+        assert_eq!(state.pending_order_statuses_count(), 1);
+        assert!(state.pending_order_statuses_has(&Oid::new(3)));
+
+        let changed = state
+            .apply_order_diffs_hft(make_diff_batch(vec![new_diff("xyz:AMD", 1), new_diff("@107", 2), new_diff("BTC", 3)]))
+            .unwrap();
+        assert_eq!(changed, HashSet::from([Coin::new("BTC")]));
+        assert_eq!(state.pending_new_diffs_count(), 0);
+        assert_eq!(state.order_count(), 1);
+    }
+
+    #[test]
+    fn test_hip3_dex_filter_keeps_one_dex_only() {
+        let mut state = state_tracking(MarketFilter::new(false, false, true, vec!["xyz".to_string()]));
+
+        // Diffs first this time: skipped markets must not wait in the diff cache either.
+        let changed = state
+            .apply_order_diffs_hft(make_diff_batch(vec![new_diff("xyz:AMD", 1), new_diff("io:GOLD", 2), new_diff("BTC", 3)]))
+            .unwrap();
+        assert!(changed.is_empty());
+        assert_eq!(state.pending_new_diffs_count(), 1);
+        assert!(state.pending_new_diffs_has(&Oid::new(1)));
+
+        let changed = state
+            .apply_order_statuses_hft(make_status_batch(vec![
+                make_order_status("xyz:AMD", 1, "open"),
+                make_order_status("io:GOLD", 2, "open"),
+                make_order_status("BTC", 3, "open"),
+            ]))
+            .unwrap();
+        assert_eq!(changed, HashSet::from([Coin::new("xyz:AMD")]));
+        assert_eq!(state.pending_order_statuses_count(), 0);
+        assert_eq!(state.order_count(), 1);
+    }
+
+    #[test]
+    fn test_filtered_trigger_orders_are_not_tracked() {
+        let mut state = state_tracking(MarketFilter::new(true, false, false, Vec::new()));
+        state
+            .apply_order_statuses_hft(make_status_batch(vec![
+                make_trigger_status("xyz:AMD", 1, "open", "1.0"),
+                make_trigger_status("BTC", 2, "open", "110.0"),
+            ]))
+            .unwrap();
+        assert_eq!(state.untriggered_count(), 1);
+        let (_, _, orders) = state.untriggered_snapshot(None);
+        assert_eq!(orders[0].coin, Coin::new("BTC"));
+    }
+
+    #[test]
+    fn test_snapshot_builds_no_book_for_a_filtered_market() {
+        let mut books = snapshot_with_triggers("BTC", &[1], &[]).value();
+        books.extend(snapshot_with_triggers("xyz:AMD", &[2], &[]).value());
+        books.extend(snapshot_with_triggers("@107", &[3], &[]).value());
+
+        let perps = OrderBookState::from_snapshot(
+            Snapshots::new(books.clone()),
+            Vec::new(),
+            0,
+            0,
+            true,
+            MarketFilter::new(true, false, false, Vec::new()),
+            true,
+        );
+        assert_eq!(perps.compute_universe(), HashSet::from([Coin::new("BTC")]));
+        assert_eq!(perps.order_count(), 1);
+
+        let everything =
+            OrderBookState::from_snapshot(Snapshots::new(books), Vec::new(), 0, 0, true, MarketFilter::all(), true);
+        assert_eq!(everything.compute_universe().len(), 3);
+    }
+
+    #[test]
+    fn test_carry_forward_treats_triggers_in_untracked_markets_as_a_real_dump() {
+        let perps = || MarketFilter::new(true, false, false, Vec::new());
+        let mut prev = state_tracking(perps());
+        prev.apply_order_statuses_hft(make_status_batch(vec![make_trigger_status("BTC", 7, "open", "110.0")]))
+            .unwrap();
+        assert_eq!(prev.untriggered_count(), 1);
+
+        // Triggers embedded in the book sides, all for an untracked market: the
+        // dump is authoritative, so the old BTC stop must not come back.
+        let mut embedded = OrderBookState::from_snapshot(
+            snapshot_with_triggers("xyz:AMD", &[], &[9]),
+            Vec::new(),
+            0,
+            0,
+            true,
+            perps(),
+            true,
+        );
+        embedded.carry_forward_untriggered(&prev);
+        assert_eq!(embedded.untriggered_count(), 0);
+
+        // The same through the separate untriggered list.
+        let mut listed = OrderBookState::from_snapshot(
+            Snapshots::new(HashMap::new()),
+            vec![make_inner_order("xyz:AMD", 9, true)],
+            0,
+            0,
+            true,
+            perps(),
+            true,
+        );
+        listed.carry_forward_untriggered(&prev);
+        assert_eq!(listed.untriggered_count(), 0);
+
+        // A dump with no trigger in any market still carries the table forward.
+        let mut barren =
+            OrderBookState::from_snapshot(snapshot_with_triggers("BTC", &[1], &[]), Vec::new(), 0, 0, true, perps(), true);
+        barren.carry_forward_untriggered(&prev);
+        assert_eq!(barren.untriggered_count(), 1);
     }
 
     #[test]
